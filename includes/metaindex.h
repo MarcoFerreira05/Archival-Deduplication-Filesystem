@@ -9,11 +9,23 @@ typedef struct filemeta {
   size_t sizeFisico;
 } Filemeta;
 
+typedef struct fileInfo {
+  size_t offset;
+  size_t counter;
+} FileInfo;
+
+typedef struct blockIndice {
+  char *path;
+  size_t offset;
+} BlockIndice;
+
 // structure containing the hashtable structure, global mutex and condition
 // variable
 typedef struct index {
-  GHashTable *htable;
-
+  GHashTable *hash_to_FileInfo;
+  GHashTable *file_to_hash;
+  GHashTable *empty_blocks_set;
+  GHashTable *file_to_sizes;
   pthread_mutex_t mutex;
 } Index;
 

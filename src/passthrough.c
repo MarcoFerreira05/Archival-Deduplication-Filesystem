@@ -22,6 +22,7 @@
  * \include passthrough.c
  */
 
+#include <stddef.h>
 #define FUSE_USE_VERSION 31
 
 #define _GNU_SOURCE
@@ -439,6 +440,14 @@ static int xmp_write(const char *path, const char *buf, size_t size,
 
   if (fd == -1)
     return -errno;
+
+  size_t num_blocks = size / BLOCK_SIZE;
+  char *hash_bytes;
+  char *block;
+  for (int i = 0; i < num_blocks; i++) {
+    memcpy(block, buf + i * BLOCK_SIZE, BLOCK_SIZE);
+    hash(block, hash_bytes);
+  }
 
   res = pwrite(fd, buf, size, offset);
   if (res == -1)
