@@ -2,3 +2,4 @@ compile_commands.json
 passthrough
 .cache
 build
+.vscode/c_cpp_properties.json

@@ -243,7 +243,7 @@ static int xmp_rmdir(const char *path) {
   res = rmdir(path);
   if (res == -1)
     return -errno;
-
+  
   return 0;
 }
 
