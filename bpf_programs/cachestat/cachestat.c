@@ -16,11 +16,15 @@
 #include "cachestat.skel.h"
 #include "trace_helpers.h"
 
+#define MAX_PIDS 100
+
 static struct env {
 	time_t interval;
 	int times;
 	bool timestamp;
 	bool verbose;
+	int pids[MAX_PIDS];
+	int pid_count;
 } env = {
 	.interval = 1,
 	.times = 99999999,
@@ -28,23 +32,25 @@ static struct env {
 
 static volatile bool exiting;
 
-const char *argp_program_version = "cachestat 0.1";
+const char *argp_program_version = "cachestat 0.1v2";
 const char *argp_program_bug_address =
 	"https://github.com/iovisor/bcc/tree/master/libbpf-tools";
 const char argp_program_doc[] =
-"Count cache kernel function calls.\n"
+"Count cache kernel function calls for a given set of PIDs.\n"
 "\n"
-"USAGE: cachestat [--help] [-T] [interval] [count]\n"
+"USAGE: cachestat [--help] [-T] [interval] [count] [--pids pid1,pid2,...]\n"
 "\n"
 "EXAMPLES:\n"
-"    cachestat          # shows hits and misses to the file system page cache\n"
-"    cachestat -T       # include timestamps\n"
-"    cachestat 1 10     # print 1 second summaries, 10 times\n";
+"    cachestat						# shows hits and misses to the file system page cache\n"
+"    cachestat -T					# include timestamps\n"
+"    cachestat 1 10					# print 1 second summaries, 10 times\n"
+"	 cachestat --pids 123,456,789	# PIDs to consider for tracing";
 
 static const struct argp_option opts[] = {
 	{ "timestamp", 'T', NULL, 0, "Print timestamp", 0 },
 	{ "verbose", 'v', NULL, 0, "Verbose debug output", 0 },
 	{ NULL, 'h', NULL, OPTION_HIDDEN, "Show the full help", 0 },
+	{ "pids", 'p', "PIDLIST", 0, "Comma-separated list of PIDs", 0 },
 	{},
 };
 
@@ -83,6 +89,22 @@ static error_t parse_arg(int key, char *arg, struct argp_state *state)
 		}
 		pos_args++;
 		break;
+	case 'p': {
+		char *token;
+		char *input = strdup(arg);
+		char *rest = input;
+		env.pid_count = 0;
+		while((token = strtok_r(rest, ",", &rest))) {
+			if(env.pid_count >= MAX_PIDS) {
+				fprintf(stderr, "Too many PIDs\n");
+				free(input);
+				argp_usage(state);
+			}
+			env.pids[env.pid_count++] = atoi(token);
+		}
+		free(input);
+		break;
+	}
 	default:
 		return ARGP_ERR_UNKNOWN;
 	}
@@ -239,6 +261,13 @@ int main(int argc, char **argv)
 	if (!obj->bss) {
 		fprintf(stderr, "Memory-mapping BPF maps is supported starting from Linux 5.7, please upgrade.\n");
 		goto cleanup;
+	}
+
+	uint32_t pid, value = 1;
+	for(int i = 0; i < env.pid_count; i++) {
+		pid = env.pids[i];
+		bpf_map__update_elem(obj->maps.pids_to_consider, &pid, sizeof(pid), &value, sizeof(value), 0);
+		printf("Tracing PID %d\n", pid);
 	}
 
 	err = cachestat_bpf__attach(obj);
