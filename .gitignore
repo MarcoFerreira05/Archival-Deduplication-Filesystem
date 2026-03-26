@@ -5,3 +5,4 @@ build
 .vscode/c_cpp_properties.json
 *.o
 bpf_programs/cachestat/cachestat
+bpf_programs/cachestat/cachestat.skel.h
