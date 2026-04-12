@@ -7,8 +7,8 @@
 #include <sys/stat.h>
 
 #define POLL_TIMEOUT_MS 100
-
 #define MAX_SYSCALLS 512
+#define COMM_STR_LEN 32
 
 static volatile bool exiting = false;
 static void sig_handler(int sig){
@@ -31,16 +31,16 @@ const char *resolve_syscall(int nr) {
 
 /* Function to get all values from the counter map
  * Receives a pointer to the BPF skeleton (struct syscounter_bpf *skel), an array of counter_key structs to store the
- * keys (struct counter_key keys[MAX_PIDS * MAX_OPS]) and an array of long long to store the values
+ * keys (CounterKey keys[MAX_PIDS * MAX_OPS]) and an array of long long to store the values
  * (long long values[MAX_PIDS * MAX_OPS]) as arguments
  * Returns the number of entries retrieved from the map
  */
-int get_values_from_counter_map (struct syscounter_bpf *skel, struct counter_key keys[MAX_PIDS * MAX_OPS],
-								 long long values[MAX_PIDS * MAX_OPS]) {
+int get_values_from_counter_map(struct syscounter_bpf *skel, CounterKey *keys, CounterValue *values) {
 
 	int num_entries = 0;
 
-	struct counter_key cur_key, next_key;
+	CounterKey cur_key, next_key;
+	CounterValue value;
 
 	// Start with NULL to get first key
 	if (bpf_map__get_next_key(skel->maps.counter, NULL, &next_key, sizeof(next_key)) != 0) {
@@ -51,13 +51,10 @@ int get_values_from_counter_map (struct syscounter_bpf *skel, struct counter_key
 	// Iterate through the map using get_next_key until there are no more keys
 	cur_key = next_key;
 	while (1) {
-		long long counter_value;
-		if (bpf_map__lookup_elem(skel->maps.counter, &cur_key, sizeof(cur_key),
-								&counter_value, sizeof(counter_value), BPF_ANY) == 0)
-		{
+		if (bpf_map__lookup_elem(skel->maps.counter, &cur_key, sizeof(cur_key), &value, sizeof(value), BPF_ANY) == 0) {
 			// Store the key and value in the provided arrays
 			keys[num_entries] = cur_key;
-			values[num_entries] = counter_value;
+			values[num_entries] = value;
 			num_entries++;
 		}
 
@@ -72,22 +69,24 @@ int get_values_from_counter_map (struct syscounter_bpf *skel, struct counter_key
 }
 
 /* Function to get unique pid values from the counter keys
- * Receives an array of counter_key structs (struct counter_key keys[MAX_PIDS * MAX_OPS]), the number of entries
- * in the array (int num_entries) and an array of strings to store the unique pid values (char pid_list[MAX_PIDS][30])
- * as arguments
+ * Receives an array of counter_key structs (CounterKey *keys), the number of entries in the array (int num_entries)
+ * and an array of strings to store the unique pid values (char (*pid_list)[COMM_STR_LEN]) as arguments
  * Returns the number of unique pid values found
  */
-int get_unique_pid_values(struct counter_key keys[MAX_PIDS * MAX_OPS], int num_entries, char pid_list[MAX_PIDS][30]) {
+int get_unique_pid_values(CounterKey *keys, int num_entries, char (*pid_list)[COMM_STR_LEN]) {
+
 	int pid_count = 0;
 	int found;
+	char val[COMM_STR_LEN];
 
 	for (int i = 0; i < num_entries; i++) {
-		char val[30];
 		snprintf(val, sizeof(val), "%s-%d", keys[i].command, keys[i].pid);
 
 		found = 0;
-		for (int j = 0; j < pid_count; j++)
+		for (int j = 0; j < pid_count && !found; j++) {
 			if (strcmp(pid_list[j], val)==0) found = 1;
+		}
+
 		if (!found) {
 			strcpy(pid_list[pid_count++], val);
 		}
@@ -97,11 +96,12 @@ int get_unique_pid_values(struct counter_key keys[MAX_PIDS * MAX_OPS], int num_e
 }
 
 /* Function to get unique op values from the counter keys
- * Receives an array of counter_key structs (struct counter_key keys[MAX_PIDS * MAX_OPS]), the number of entries
+ * Receives an array of counter_key structs (CounterKey keys[MAX_PIDS * MAX_OPS]), the number of entries
  * in the array (int num_entries) and an array of integers to store the unique op values (int op_list[MAX_OPS]) as arguments
  * Returns the number of unique op values found
 */
-int get_unique_op_values(struct counter_key keys[MAX_PIDS * MAX_OPS], int num_entries, int op_list[MAX_OPS]) {
+int get_unique_op_values(CounterKey *keys, int num_entries, int *op_list) {
+
 	int op_count = 0;
 	int found;
 
@@ -116,41 +116,45 @@ int get_unique_op_values(struct counter_key keys[MAX_PIDS * MAX_OPS], int num_en
 }
 
 /* Function to print the results in a table format
- * Receives an array of counter_key structs (struct counter_key keys[MAX_PIDS * MAX_OPS]), an array of
- * long long values (long long values[MAX_PIDS * MAX_OPS]), the number of entries in the arrays (int num_entries),
- * an array of strings with the unique pid values (char pid_list[MAX_PIDS][30]), the number of unique pid values
- * (int pid_count), an array of integers with the unique op values (int op_list[MAX_OPS]) and the number of unique
- * op values (int op_count) as arguments
+ * Receives an array of CounterKey (CounterKey *keys), an array of CounterValue (CounterValue *values),
+ * the number of entries in the arrays (int num_entries), an array of strings with the unique pid values
+ * (char (*pid_list)[COMM_STR_LEN]), the number of unique pid values (int pid_count), an array of integers with the unique
+ * op values (int *op_list) and the number of unique op values (int op_count) as arguments.
  * Prints the results in a table format with the pids as rows and the ops as columns, and the total for each op at the end
  */
-void print_results(struct counter_key keys[MAX_PIDS * MAX_OPS], long long values[MAX_PIDS * MAX_OPS],
-				   int num_entries, char pid_list[MAX_PIDS][30], int pid_count, int op_list[MAX_OPS], int op_count) {
+void print_results(CounterKey *keys, CounterValue *values, int num_entries, char (*pid_list)[COMM_STR_LEN], int pid_count,
+				   int *op_list, int op_count) {
 
-	long long total_op_list[MAX_OPS] = {0};
+	CounterValue total_op_list[MAX_OPS] = {0};
 
-	printf("%-30s", "PID\\OP");
+	printf("%-32s", "PID\\OP");
 	for (int i = 0; i < op_count; i++)
-		printf("%-16s", resolve_syscall(op_list[i]));
+		printf("%-20s", resolve_syscall(op_list[i]));
 	printf("\n");
 
-	int total_width = 30 + op_count * 16;
+	int total_width = COMM_STR_LEN + op_count * 20;
 	for (int i = 0; i < total_width; i++)
 		putchar('-');
 	printf("\n");
 
-	char comm[30];
+	char comm[COMM_STR_LEN];
 	for (int j = 0; j < pid_count; j++) {
-		printf("%-30s", pid_list[j]);
+		printf("%-32s", pid_list[j]);
 		for (int i = 0; i < op_count; i++) {
-			long long val = 0;
+			CounterValue val = {0};
 			for (int k = 0; k < num_entries; k++) {
-				sprintf(comm, "%s-%d", keys[k].command, keys[k].pid);
+				snprintf(comm, COMM_STR_LEN, "%s-%d", keys[k].command, keys[k].pid);
 				if ((strcmp(comm,pid_list[j])==0) && keys[k].op == op_list[i]) {
 					val = values[k];
-					total_op_list[i] += values[k];
+					total_op_list[i].count += values[k].count;
+					total_op_list[i].enter_time_sum += values[k].enter_time_sum;
+					total_op_list[i].exit_time_sum += values[k].exit_time_sum;
 				}
 			}
-			printf("%-16lld", val);
+			long delta = (val.exit_time_sum - val.enter_time_sum) / 1e6;  // milliseconds
+			char cell[20];
+			snprintf(cell, sizeof(cell), "%03ldx | %ldms", val.count, delta);
+			printf("%-20s", cell);
 		}
 		printf("\n");
 	}
@@ -159,9 +163,12 @@ void print_results(struct counter_key keys[MAX_PIDS * MAX_OPS], long long values
 		putchar('-');
 	printf("\n");
 
-	printf("%-30s", "Total");
+	printf("%-32s", "Total");
 	for (int i = 0; i < op_count; i++) {
-		printf("%-16lld", total_op_list[i]);
+		long delta = (total_op_list[i].exit_time_sum - total_op_list[i].enter_time_sum) / 1e6;  // milliseconds
+		char cell[20];
+		snprintf(cell, sizeof(cell), "%03ldx | %ldms", total_op_list[i].count, delta);
+		printf("%-20s", cell);
 	}
 	printf("\n");
 }
@@ -191,7 +198,7 @@ int main(int argc, char *argv[]) {
 	for (int i = 1; i < argc; i++) {
 		key = atoi(argv[i]);
 		uint32_t value = 1;
-		bpf_map__update_elem(skel->maps.my_config, &key, sizeof(key), &value, sizeof(value), 0);
+		bpf_map__update_elem(skel->maps.pids_to_consider, &key, sizeof(key), &value, sizeof(value), 0);
 		printf("Tracing Pid %d\n", key);
 	}
 
@@ -212,17 +219,22 @@ int main(int argc, char *argv[]) {
 	printf("\n");
 
 	/* Print values stored in counter map */
-	struct counter_key keys[MAX_PIDS * MAX_OPS];
-	long long values[MAX_PIDS * MAX_OPS];
-	char pid_list[MAX_PIDS][30];
-	int op_list[MAX_OPS];
+	CounterKey *keys = malloc(sizeof(CounterKey) * MAX_PIDS * MAX_OPS);
+	CounterValue *values = malloc(sizeof(CounterValue) * MAX_PIDS * MAX_OPS);
+	char (*pid_list)[COMM_STR_LEN] = malloc(sizeof(char[COMM_STR_LEN]) * MAX_PIDS);
+	int *op_list = malloc(sizeof(int) * MAX_OPS);
 
-	int num_entries = get_values_from_counter_map (skel, keys, values);
+	int num_entries = get_values_from_counter_map(skel, keys, values);
 	if (num_entries) {
 		int pid_count = get_unique_pid_values(keys, num_entries, pid_list);
 		int op_count = get_unique_op_values(keys, num_entries, op_list);
 		print_results(keys, values, num_entries, pid_list, pid_count, op_list, op_count);
 	}
+
+	free(keys);
+	free(values);
+	free(pid_list);
+	free(op_list);
 
 	cleanup:
 	syscounter_bpf__destroy(skel);
