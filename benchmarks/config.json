@@ -1,0 +1,8 @@
+{
+	"write_pcnt": 40,
+	"read_pcnt": 40,
+	"unlink_pcnt": 20,
+	"dup_pcnt": 50,
+	"block_range": [1,5],
+	"num_ops": 100
+}
