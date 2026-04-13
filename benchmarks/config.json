@@ -1,8 +1,9 @@
 {
-	"write_pcnt": 40,
-	"read_pcnt": 40,
-	"unlink_pcnt": 20,
+	"write_pcnt": 100,
+	"read_pcnt": 0,
+	"unlink_pcnt": 0,
 	"dup_pcnt": 50,
-	"block_range": [1,5],
-	"num_ops": 100
+	"block_range": [1,1],
+	"num_ops": 10,
+	"num_files": 3
 }
