@@ -8,6 +8,7 @@ build
 *.o
 bpf_programs/cachestat/cachestat
 bpf_programs/cachestat/cachestat.skel.h
+bpf_programs/cachestat/x86/
 bpf_programs/syscounter/syscounter
 bpf_programs/syscounter/syscounter.skel.h
 bpf_programs/syscounter/vmlinux.h
