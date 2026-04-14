@@ -1,7 +1,7 @@
 import json
 import random
 import os
-from .benchmark_state import State
+from benchmark_state import State
 
 def get_config():
     """
@@ -56,7 +56,7 @@ def write(state: State):
     # now execute the write operation at once
     file = state.get_random_file()
     if file["fd"] == -1:
-        file["fd"] = os.open(file["path"], os.O_RDWR | os.O_APPEND | os.O_CREAT, mode=666)
+        file["fd"] = os.open(file["path"], os.O_RDWR | os.O_APPEND | os.O_CREAT, mode=0o666)
     buf = state.get_buffer(num_blocks * 4096)
     bytes_written = os.write(file["fd"], buf)
     if bytes_written != num_bytes:
@@ -74,6 +74,8 @@ def read(state: State):
 
     file = state.get_random_file()
     fd = file["fd"]
+    if fd == -1 or not file["exists"]:
+        return
 
     num_blocks = state.get_num_blocks()
     max_blocks = file["size"] // 4096
@@ -95,9 +97,14 @@ def unlink(state: State):
     """
 
     file = state.get_random_file()
+    fd = file["fd"]
+    path = file["path"]
 
-    _ = os.close(file["fd"])
-    _ = os.unlink(file["path"])
+    if fd != -1:
+        _ = os.close(file["fd"])
+    if file["exists"]:
+        _ = os.unlink(file["path"])
+        file["exists"] = False
 
     file["fd"] = -1
     file["size"] = 0

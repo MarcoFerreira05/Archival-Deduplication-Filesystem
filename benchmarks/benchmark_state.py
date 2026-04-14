@@ -19,8 +19,8 @@ class State():
 
         # file tracking
 
-        self.files: list[dict[str,int|str]] = [
-            {"fd": -1, "path": f"test_file{i}", "size": 0}
+        self.files = [
+            {"fd": -1, "path": f"test_file{i}", "size": 0, "exists": False}
             for i in range(self.num_files)
         ]
 
@@ -59,7 +59,7 @@ class State():
         dup_rand = random.randint(0, 100)
         return dup_rand < self.dup_pcnt
 
-    def get_random_file(self) -> dict[str,int|str]:
+    def get_random_file(self):
         """
         Returns the file dictionary of a random test file.
         """
