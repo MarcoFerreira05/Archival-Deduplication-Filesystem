@@ -1,0 +1,10 @@
+{
+	"write_pcnt": 50,
+	"read_pcnt": 40,
+	"unlink_pcnt": 10,
+	"dup_pcnt": 30,
+	"block_range": [1,5],
+	"num_ops": 1000000,
+	"num_files": 12,
+	"num_unique_dup_blocks": 32
+}
