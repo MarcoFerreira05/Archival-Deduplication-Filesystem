@@ -56,7 +56,7 @@ class State():
         """
         Determines if a block should be duplicate or not, based on the configured percentage.
         """
-        dup_rand = random.randint(0, 100)
+        dup_rand = random.randint(0, 99)
         return dup_rand < self.dup_pcnt
 
     def get_random_file(self):

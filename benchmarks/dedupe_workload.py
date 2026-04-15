@@ -115,7 +115,7 @@ def workload(state: State):
     print("Workload started...")
     random.seed(42)
     for _ in range(state.num_ops):
-        operation_rand = random.randint(0, 100)
+        operation_rand = random.randint(0, 99)
         
         write_threshold = state.write_pcnt
         read_threshold = write_threshold + state.read_pcnt
