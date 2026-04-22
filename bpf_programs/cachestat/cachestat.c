@@ -44,7 +44,7 @@ const char argp_program_doc[] =
 "    cachestat						# shows hits and misses to the file system page cache\n"
 "    cachestat -T					# include timestamps\n"
 "    cachestat 1 10					# print 1 second summaries, 10 times\n"
-"	 cachestat --pids 123,456,789	# PIDs to consider for tracing";
+"    cachestat --pids 123,456,789			# PIDs to consider for tracing";
 
 static const struct argp_option opts[] = {
 	{ "timestamp", 'T', NULL, 0, "Print timestamp", 0 },

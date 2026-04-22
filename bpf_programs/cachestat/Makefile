@@ -50,6 +50,9 @@ cachestat: $(OUTPUT)/cachestat.o $(COMMON_OBJ) | $(OUTPUT)
 	$(call msg,BINARY,$@)
 	$(Q)$(CC) $(CFLAGS) $^ $(LDFLAGS) -lbpf -lelf -lz -o $@
 
+vmlinux.h:
+	bpftool btf dump file /sys/kernel/btf/vmlinux format c > vmlinux.h
+
 $(OUTPUT)/cachestat.o: cachestat.skel.h
 
 $(OUTPUT)/%.o: %.c $(wildcard %.h) | $(OUTPUT)
@@ -60,7 +63,7 @@ cachestat.skel.h: $(OUTPUT)/cachestat.bpf.o | $(OUTPUT)
 	$(call msg,GEN-SKEL,$@)
 	$(Q)$(BPFTOOL) gen skeleton $< > $@
 
-$(OUTPUT)/cachestat.bpf.o: cachestat.bpf.c x86/vmlinux.h | $(OUTPUT)
+$(OUTPUT)/cachestat.bpf.o: cachestat.bpf.c vmlinux.h | $(OUTPUT)
 	$(call msg,BPF,$@)
 	$(Q)$(CLANG) $(BPFCFLAGS) -target bpf -D__TARGET_ARCH_x86 \
 		     -Ix86/ $(INCLUDES) -c $(filter %.c,$^) -o $@ && \
