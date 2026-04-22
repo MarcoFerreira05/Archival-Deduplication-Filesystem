@@ -1,10 +1,10 @@
 {
-	"write_pcnt": 99,
-	"read_pcnt": 0,
-	"unlink_pcnt": 1,
+	"write_pcnt": 50,
+	"read_pcnt": 50,
+	"unlink_pcnt": 0,
 	"dup_pcnt": 0,
 	"block_range": [1,1],
-	"num_ops": 10000,
+	"num_ops": 1000,
 	"num_files": 1,
 	"num_unique_dup_blocks": 1,
 	"test_file_path_format": "/mnt/fs/test_file{index}"

@@ -20,8 +20,16 @@ def get_config():
     if config["dup_pcnt"] > 100 or config["dup_pcnt"] < 0:
         print("Invalid duplicate percentage")
         return None
-    if config["block_range"][0] < 0 or config["block_range"][1] < config["block_range"][0]:
-        print("Invalid range limits")
+    block_range = config.get("block_range")
+    if (
+        not isinstance(block_range, list)
+        or len(block_range) != 2
+        or not all(isinstance(v, int) for v in block_range)
+    ):
+        print("Invalid block range, expected [min_blocks, max_blocks]")
+        return None
+    if block_range[0] < 1 or block_range[1] < block_range[0]:
+        print("Invalid range limits, minimum must be at least 1 block (4096 bytes)")
         return None
     if config["num_ops"] <= 0:
         print("Number of operations must be greater than 0")
@@ -104,7 +112,9 @@ def read(state: State):
     size = num_blocks * 4096
     buf = state.get_buffer(size)
 
-    result = os.pread(fd, size, offset)
+    os.lseek(fd, offset, os.SEEK_SET)
+    result = os.read(fd, size)
+    #result = os.pread(fd, size, offset)
     if len(result) != size:
         print("A read request returned a result with an incorrect length!!!")
 
@@ -161,8 +171,9 @@ def main():
     state.free()
 
     print("Benchmark done!")
-    print(f"Number of duplicate blocks written: {total_dup}")
-    print(f"Number of non-duplicate blocks written: {total_non_dup}")
+    print(f"Blocks written with a repeated pattern (dedup candidates): {total_dup}")
+    print(f"Blocks written with a unique pattern (non-dedup): {total_non_dup}")
+    print(f"Total blocks written: {total_dup + total_non_dup}")
 
 
 if __name__ == '__main__':

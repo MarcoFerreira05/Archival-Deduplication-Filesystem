@@ -42,11 +42,7 @@ class State():
             self.dup_blocks.append(block)
 
         self.unique_block: bytearray = bytearray(4096)
-        mv = memoryview(self.unique_block)
-        self.unique_value: int = self.num_unique_dup_blocks + 1
-        for i in range(4096):
-            mv[i] = self.unique_value
-        self.unique_block_index: int = 0
+        self.unique_counter: int = self.num_unique_dup_blocks + 1
 
         # this buffer is reused everytime we want to build a write request, so it has the maximum capacity
         self.buffer: bytearray = bytearray(4096*self.block_range[1])
@@ -83,20 +79,18 @@ class State():
 
     def append_unique_block(self, block_index: int):
         """
-        Appends a unique block to the internal buffer and updates the unique block.
+        Appends a unique block to the internal buffer.
         """
         start = block_index * 4096
         end = start + 4096
+
+        pattern = self.unique_counter.to_bytes(8, byteorder="little", signed=False)
+        self.unique_block[:] = pattern * (4096 // 8)
         self.buffer[start:end] = self.unique_block
 
-        # keep the unique block unique
-        self.unique_block[self.unique_block_index] = self.unique_value
-        self.unique_block_index += 1
-        if self.unique_block_index == 4096:
-            self.unique_block_index = 0
-            self.unique_value += 1
-            if self.unique_value == 256:
-                self.unique_value = 1
+        self.unique_counter += 1
+        if self.unique_counter == (1 << 64):
+            self.unique_counter = 0
 
     def get_buffer(self, size: int) -> memoryview:
         """
