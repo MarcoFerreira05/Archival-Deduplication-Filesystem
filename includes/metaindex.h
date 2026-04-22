@@ -1,6 +1,7 @@
 #ifndef METAINDEX_H
 #define METAINDEX_H
 
+#include "persistence.h"
 #include <glib.h>
 #include <pthread.h>
 #include <stddef.h>
@@ -18,7 +19,7 @@ typedef struct masterInfo {
   unsigned char hash[HASH_SIZE]; // SHA-512 hash of the block content
   uint64_t masterBlockIndex;     // block index in the Masterfile (byte offset =
                                  // masterBlockIndex * BLOCK_SIZE)
-  uint32_t refcount; // number of logical (file, block) references
+  uint32_t refcount;             // number of logical (file, block) references
 } MasterInfo;
 
 typedef struct blockIndice {
@@ -34,6 +35,24 @@ typedef struct index {
   GHashTable *file_to_sizes;  // path (char*) -> size_t* (logical file size)
   pthread_mutex_t mutex;
 } Index;
+
+Bytes encode_master_info(void *elem);
+void *decode_master_info(void *data, int size);
+
+Bytes encode_hash(void *elem);
+void *decode_hash(void *data, int size);
+
+Bytes encode_block_indice(void *elem);
+void *decode_block_indice(void *data, int size);
+
+Bytes encode_free_block(void *elem);
+void *decode_free_block(void *data, int size);
+
+Bytes encode_size(void *elem);
+void *decode_size(void *data, int size);
+
+Bytes encode_str(void *elem);
+void *decode_str(void *data, int size);
 
 // Initializes the index structure.
 // Returns NULL in case of failure and a pointer to the struct otherwise.

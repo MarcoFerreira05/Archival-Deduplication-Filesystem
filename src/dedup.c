@@ -26,15 +26,13 @@
 #include "metaindex.h"
 #include "passthrough_helpers.h"
 
-static int master_read(int fdMaster, off_t offset, char *buff)
-{
+static int master_read(int fdMaster, off_t offset, char *buff) {
   return pread(fdMaster, buff, BLOCK_SIZE, offset);
 }
 
 // Single-lookup read: (file, blockIndex) -> MasterInfo -> master file
 static int read_block(int fdMaster, const char *path, uint64_t block_index,
-                      char *buff, Index *index)
-{
+                      char *buff, Index *index) {
   MasterInfo *info = lookup_by_file_block(index, path, block_index);
   if (info == NULL)
     return -1;
@@ -44,19 +42,16 @@ static int read_block(int fdMaster, const char *path, uint64_t block_index,
 // Read file content block by block from the master file.
 // For each logical block, we look up the MasterInfo and read from the master.
 int read_dedup(Index *index, const char *path, char *buf, size_t size,
-               off_t offset, int masterFd)
-{
+               off_t offset, int masterFd) {
   ssize_t total_read = 0;
   size_t num_blocks = size / BLOCK_SIZE;
   uint64_t start_block = offset / BLOCK_SIZE;
   int res = 0;
-  for (size_t i = 0; i < num_blocks; i++)
-  {
+  for (size_t i = 0; i < num_blocks; i++) {
     char buff[BLOCK_SIZE];
     // one lookup: (file, block) -> MasterInfo -> pread from master
     res = read_block(masterFd, path, start_block + i, buff, index);
-    if (res == -1)
-    {
+    if (res == -1) {
       return res;
     }
     memcpy(buf + i * BLOCK_SIZE, buff, BLOCK_SIZE);
@@ -67,8 +62,7 @@ int read_dedup(Index *index, const char *path, char *buf, size_t size,
 
 // Remove a single logical block reference. Decrements refcount and reclaims
 // the master block if no more references exist.
-void remove_block_dedup(Index *index, const char *path, uint64_t blockIndex)
-{
+void remove_block_dedup(Index *index, const char *path, uint64_t blockIndex) {
   // find the MasterInfo for this (file, block)
   MasterInfo *info = lookup_by_file_block(index, path, blockIndex);
   if (info == NULL)
@@ -79,12 +73,10 @@ void remove_block_dedup(Index *index, const char *path, uint64_t blockIndex)
   info->refcount--;
 
   // if nobody else references this block, free it and reclaim the space
-  if (info->refcount == 0)
-  {
+  if (info->refcount == 0) {
     uint64_t *slot = malloc(sizeof(uint64_t));
     *slot = info->masterBlockIndex;
-    index->free_block_list =
-        g_slist_prepend(index->free_block_list, slot);
+    index->free_block_list = g_slist_prepend(index->free_block_list, slot);
 
     remove_hash(index, info->hash);
     free(info);
@@ -96,16 +88,14 @@ void remove_block_dedup(Index *index, const char *path, uint64_t blockIndex)
 //     - MISS: write to master, create new MasterInfo
 //  2. point this (file, block) at the MasterInfo
 int write_dedup(Index *index, const char *path, const char *buf, size_t size,
-                off_t offset, int masterFd, uint64_t *nextBlockIndex)
-{
+                off_t offset, int masterFd, uint64_t *nextBlockIndex) {
   size_t num_blocks = size / BLOCK_SIZE;
   uint64_t start_block = offset / BLOCK_SIZE;
   int res = 0;
   unsigned char hash_bytes[HASH_SIZE];
   unsigned char block[BLOCK_SIZE];
 
-  for (size_t i = 0; i < num_blocks; i++)
-  {
+  for (size_t i = 0; i < num_blocks; i++) {
     uint64_t blk = start_block + i;
 
     memcpy(block, buf + i * BLOCK_SIZE, BLOCK_SIZE);
@@ -129,28 +119,22 @@ int write_dedup(Index *index, const char *path, const char *buf, size_t size,
 
     // check if this content already exists somewhere in the master
     MasterInfo *info = lookup_by_hash(index, hash_bytes);
-    if (info != NULL)
-    {
+    if (info != NULL) {
       // HIT: same content already stored, just add another reference
       printf("HIT\n");
       info->refcount++;
-    }
-    else
-    {
+    } else {
       // MISS: new content, need to write it to the master file
       printf("MISS\n");
 
       // try to reuse a freed slot, otherwise append at the end
       uint64_t masterBlk;
-      if (index->free_block_list != NULL)
-      {
+      if (index->free_block_list != NULL) {
         masterBlk = *(uint64_t *)index->free_block_list->data;
         free(index->free_block_list->data);
-        index->free_block_list = g_slist_delete_link(
-            index->free_block_list, index->free_block_list);
-      }
-      else
-      {
+        index->free_block_list =
+            g_slist_delete_link(index->free_block_list, index->free_block_list);
+      } else {
         masterBlk = *nextBlockIndex;
         (*nextBlockIndex)++;
       }
@@ -178,14 +162,11 @@ int write_dedup(Index *index, const char *path, const char *buf, size_t size,
   // update the logical file size (only grows, never shrinks here)
   size_t new_end = (start_block + num_blocks) * BLOCK_SIZE;
   size_t *logical_size = g_hash_table_lookup(index->file_to_sizes, path);
-  if (logical_size == NULL)
-  {
+  if (logical_size == NULL) {
     logical_size = malloc(sizeof(size_t));
     *logical_size = new_end;
     g_hash_table_insert(index->file_to_sizes, g_strdup(path), logical_size);
-  }
-  else if (new_end > *logical_size)
-  {
+  } else if (new_end > *logical_size) {
     *logical_size = new_end;
   }
 

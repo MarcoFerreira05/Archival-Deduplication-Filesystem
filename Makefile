@@ -1,6 +1,6 @@
 CC = gcc
 
-CFLAGS  = -Wall -Iincludes -D_GNU_SOURCE 
+CFLAGS  = -Wall -Iincludes -D_GNU_SOURCE -g
 CFLAGS += $(shell pkg-config --cflags fuse3 glib-2.0)
 LIBS   = $(shell pkg-config --libs fuse3 glib-2.0) -lpthread -lbz2 -lcrypto
 SRC = $(wildcard src/*.c)

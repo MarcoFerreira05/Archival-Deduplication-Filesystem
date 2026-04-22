@@ -53,7 +53,6 @@
 #include <sys/xattr.h>
 #endif
 
-#include "hashing.h"
 #include "metaindex.h"
 #include "passthrough_helpers.h"
 
@@ -67,6 +66,7 @@ typedef struct context {
   uint64_t write;
   uint64_t read;
   uint64_t getattr;
+  uint64_t unlink;
   pthread_mutex_t mutex;
   FILE *fp;
   Index *index;
@@ -110,6 +110,8 @@ static void *xmp_init(struct fuse_conn_info *conn, struct fuse_config *cfg) {
   ctx->close = 0;
   ctx->read = 0;
   ctx->write = 0;
+  ctx->getattr = 0;
+  ctx->unlink = 0;
   struct fuse_context *f_ctx = fuse_get_context();
   ctx->fp = fopen(DEBUG, "w");
   printf("[Thread %d] Init called, userid %d, pid %d\n", gettid(), f_ctx->uid,
@@ -132,15 +134,17 @@ static void xmp_destroy(void *private_data) {
 #ifdef DEBUG
   printf("[Thread %d] Destroy called, userid %d, pid %d\n", gettid(),
          f_ctx->uid, f_ctx->pid);
-  printf(
-      "[Thread %d] Open() - %lu, Read() - %lu, Write() - %lu, Close() - %lu\n",
-      gettid(), p_ctx->open, p_ctx->read, p_ctx->write, p_ctx->close);
-  fprintf(p_ctx->fp, "[Thread %d] Destroy called, userid %d, pid %d\n",
+  printf("[Thread %d] Open() - %lu, Read() - %lu, Write() - %lu, Close() - "
+         "%lu, Getattr() - %lu, Unlink() - %lu\n",
+         gettid(), p_ctx->open, p_ctx->read, p_ctx->write, p_ctx->close,
+         p_ctx->getattr, p_ctx->unlink);
+  fprintf(p_ctx->fp, "[Thread %d] Destroy called,userid %d,pid % d\n ",
           gettid(), f_ctx->uid, f_ctx->pid);
-  fprintf(
-      p_ctx->fp,
-      "[Thread %d] Open() - %lu, Read() - %lu, Write() - %lu, Close() - %lu\n",
-      gettid(), p_ctx->open, p_ctx->read, p_ctx->write, p_ctx->close);
+  // fprintf(
+  //     p_ctx->fp,
+  //     "[Thread %d] Open() - %lu, Read() - %lu, Write() - %lu, Close() -
+  //     %lu\n", gettid(), p_ctx->open, p_ctx->read, p_ctx->write,
+  //     p_ctx->close);
   fclose(p_ctx->fp);
 #endif
 
@@ -240,9 +244,16 @@ static int xmp_unlink(const char *path) {
   struct fuse_context *f_ctx = fuse_get_context();
   Context *p_ctx = (Context *)f_ctx->private_data;
 
+#ifdef DEBUG
+  p_ctx->unlink++;
+  printf("[Thread %d] Unlink for path %s, userid %d, pid %d\n", gettid(), path,
+         f_ctx->uid, f_ctx->pid);
+  // fprintf(p_ctx->fp, "[Thread %d] Unlink for path %s, userid %d, pid %d\n",
+  //         gettid(), path, f_ctx->uid, f_ctx->pid);
+#endif
+
   pthread_mutex_lock(&p_ctx->index->mutex);
-  size_t *logical_size =
-      g_hash_table_lookup(p_ctx->index->file_to_sizes, path);
+  size_t *logical_size = g_hash_table_lookup(p_ctx->index->file_to_sizes, path);
   if (logical_size != NULL) {
     // walk through every block of the file and remove its reference
     uint64_t num_blocks = (*logical_size + BLOCK_SIZE - 1) / BLOCK_SIZE;
@@ -346,8 +357,7 @@ static int xmp_truncate(const char *path, off_t size,
   Context *p_ctx = (Context *)f_ctx->private_data;
 
   pthread_mutex_lock(&p_ctx->index->mutex);
-  size_t *logical_size =
-      g_hash_table_lookup(p_ctx->index->file_to_sizes, path);
+  size_t *logical_size = g_hash_table_lookup(p_ctx->index->file_to_sizes, path);
   if (logical_size != NULL && (size_t)size < *logical_size) {
     // only the blocks past the new size need to be removed
     uint64_t new_block_count = (size + BLOCK_SIZE - 1) / BLOCK_SIZE;
