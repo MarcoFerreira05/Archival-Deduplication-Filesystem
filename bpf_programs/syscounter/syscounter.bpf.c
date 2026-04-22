@@ -312,6 +312,30 @@ int BPF_PROG(sys_exit_close, struct pt_regs *regs, int syscall_id, long ret) {
 	return update_counter_exit(pid, tid, syscall_id);
 }
 
+SEC("tp/syscalls/sys_enter_unlink")
+int BPF_PROG(sys_enter_unlink, struct pt_regs *regs, long syscall_id, const char *pathname) {
+
+    // check if the pid is in the filter list or not. If not, return 0 to ignore this event.
+    u64 pidtid = bpf_get_current_pid_tgid();
+	u32 pid = pidtid >> 32;
+	u32 tid = pidtid;
+    if (to_discard(pid)) return 0;
+
+    // update counter for this pid and syscall close
+    return update_counter_enter(tid);
+}
+
+SEC("tp/syscalls/sys_exit_unlink")
+int BPF_PROG(sys_exit_unlink, struct pt_regs *regs, int syscall_id, long ret) {
+
+    u64 pidtid = bpf_get_current_pid_tgid();
+	u32 pid = pidtid >> 32;
+	u32 tid = pidtid;
+    if (to_discard(pid)) return 0;
+	
+	return update_counter_exit(pid, tid, syscall_id);
+}
+
 /* ----PROC-----  */
 
 // sudo cat /sys/kernel/tracing/events/sched/sched_process_fork/format

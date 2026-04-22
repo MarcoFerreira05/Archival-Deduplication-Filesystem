@@ -9,7 +9,7 @@
 #define S_IFREG 0100000
 #endif
 
-#define MAX_OPS 6
+#define MAX_OPS 7
 #define MAX_PIDS 100
 #define MAX_THREADS 16
 
