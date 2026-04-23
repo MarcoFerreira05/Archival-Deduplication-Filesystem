@@ -92,6 +92,7 @@ static void *xmp_init(struct fuse_conn_info *conn, struct fuse_config *cfg) {
   cfg->entry_timeout = 0;
   cfg->attr_timeout = 0;
   cfg->negative_timeout = 0;
+  cfg->direct_io = 1;
 
   // Initialize context
   Context *ctx = malloc(sizeof(Context));

@@ -112,9 +112,7 @@ def read(state: State):
     size = num_blocks * 4096
     buf = state.get_buffer(size)
 
-    os.lseek(fd, offset, os.SEEK_SET)
-    result = os.read(fd, size)
-    #result = os.pread(fd, size, offset)
+    result = os.pread(fd, size, offset)
     if len(result) != size:
         print("A read request returned a result with an incorrect length!!!")
 
