@@ -26,6 +26,8 @@ class State():
                 "path": self.test_file_path_format.format(index=i),
                 "size": 0,
                 "exists": False,
+                "dup_blocks": 0,
+                "non_dup_blocks": 0,
             }
             for i in range(self.num_files)
         ]

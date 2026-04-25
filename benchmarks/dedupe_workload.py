@@ -5,6 +5,8 @@ from benchmark_state import State
 
 total_non_dup = 0
 total_dup = 0
+total_removed_non_dup = 0
+total_removed_dup = 0
 
 def get_config():
     """
@@ -61,7 +63,8 @@ def write(state: State):
     global total_dup, total_non_dup
 
     # first build the whole request in a single buffer
-    
+
+    file = state.get_random_file()
     num_blocks = state.get_num_blocks()
     num_bytes = num_blocks * 4096
 
@@ -72,12 +75,13 @@ def write(state: State):
         if dup:
             state.append_dup_block(i)
             total_dup += 1
+            file["dup_blocks"] += 1
         else:
             state.append_unique_block(i)
             total_non_dup += 1
+            file["non_dup_blocks"] += 1
 
     # now execute the write operation at once
-    file = state.get_random_file()
     if file["fd"] == -1:
         file["fd"] = os.open(file["path"], os.O_RDWR | os.O_APPEND | os.O_CREAT, mode=0o666)
         file["exists"] = True
@@ -119,26 +123,30 @@ def read(state: State):
 
 def unlink(state: State):
     """
-    Executes an unlink operation on a random file, closing the file descriptor.
+    Executes an unlink operation on a random file, closing the file descriptor
+    and counting removed logical blocks by type.
     """
+    global total_removed_dup, total_removed_non_dup
 
     file = state.get_random_file()
     fd = file["fd"]
-    path = file["path"]
 
     if fd != -1:
         _ = os.close(file["fd"])
     if file["exists"]:
+        total_removed_dup += file["dup_blocks"]
+        total_removed_non_dup += file["non_dup_blocks"]
         _ = os.unlink(file["path"])
         file["exists"] = False
 
     file["fd"] = -1
     file["size"] = 0
+    file["dup_blocks"] = 0
+    file["non_dup_blocks"] = 0
 
 
 
 def workload(state: State):
-    print("Workload started...")
     random.seed(42)
     for _ in range(state.num_ops):
         operation_rand = random.randint(0, 99)
@@ -153,8 +161,6 @@ def workload(state: State):
         else:
             unlink(state)
 
-    print("Workload done")
-
 
 def main():
 
@@ -168,10 +174,13 @@ def main():
     workload(state)
     state.free()
 
-    print("Benchmark done!")
+    print("Benchmark done!\n")
     print(f"Blocks written with a repeated pattern (dedup candidates): {total_dup}")
     print(f"Blocks written with a unique pattern (non-dedup): {total_non_dup}")
     print(f"Total blocks written: {total_dup + total_non_dup}")
+    print(f"Removed blocks with a repeated pattern (dedup candidates): {total_removed_dup}")
+    print(f"Removed blocks with a unique pattern (non-dedup): {total_removed_non_dup}")
+    print(f"Total removed blocks: {total_removed_dup + total_removed_non_dup}")
 
 
 if __name__ == '__main__':

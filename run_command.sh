@@ -1,8 +1,9 @@
 #!/bin/bash
 echo "PID = $$"
 echo "Press any key to continue"
+echo ""
 read -n 1 -s key
 cd benchmarks
-python3 dedupe_workload.py
+time python3 dedupe_workload.py
 cd ..
 
