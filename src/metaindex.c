@@ -142,11 +142,14 @@ static void block_indice_free(void *data) {
 Index *index_init(void) {
   Index *index = malloc(sizeof(Index));
 
+  IndexedTableLoadConfig config1 = {hash512_hash, hash512_equal, decode_hash,
+                                    g_free};
+  IndexedTableLoadConfig config2 = {blockIndice_hash, blockIndice_equal,
+                                    decode_block_indice, block_indice_free};
+
   IndexedPairTables indexed_tables = ghash_load_indexed_pair(
       TABLE_PATH_HASH_TO_MASTER, TABLE_PATH_FILE_TO_MASTER,
-      TABLE_PATH_MASTER_INFOS, hash512_hash, hash512_equal, decode_hash, g_free,
-      blockIndice_hash, blockIndice_equal, decode_block_indice,
-      block_indice_free, decode_master_info, NULL);
+      TABLE_PATH_MASTER_INFOS, config1, config2, decode_master_info, NULL);
 
   // hash_to_master: key = g_memdup'd hash (freed by g_free),
   //                 value = shared MasterInfo* (freed in index_destroy)
@@ -171,12 +174,17 @@ Index *index_init(void) {
 void index_destroy(Index *index) {
   pthread_mutex_lock(&index->mutex);
 
+  // encode_hash doesn't allocate, so free_encoded_key=FALSE
+  IndexedTableSaveConfig config1 = {encode_hash, FALSE};
+  // encode_block_indice allocates memory, so free_encoded_key=TRUE
+  IndexedTableSaveConfig config2 = {encode_block_indice, TRUE};
+
   ghash_save_indexed_pair(TABLE_PATH_HASH_TO_MASTER, TABLE_PATH_FILE_TO_MASTER,
                           TABLE_PATH_MASTER_INFOS, index->hash_to_master,
-                          index->file_to_master, encode_hash,
-                          encode_block_indice, encode_master_info);
+                          index->file_to_master, config1, config2,
+                          encode_master_info);
   ghash_save(TABLE_PATH_FILE_TO_SIZES, index->file_to_sizes, encode_str,
-             encode_size);
+             encode_size, FALSE, FALSE);
   gslist_save(TABLE_PATH_FREE_BLOCK_LIST, index->free_block_list,
               encode_free_block);
 

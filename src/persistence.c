@@ -7,6 +7,8 @@ typedef struct {
   int fd;
   EncodeFunc encode_key;
   EncodeFunc encode_val;
+  gboolean free_encoded_key;
+  gboolean free_encoded_val;
   off_t offset;
 } SaveCtx;
 
@@ -18,6 +20,7 @@ typedef struct {
 typedef struct {
   int fd;
   EncodeFunc encode_key;
+  gboolean free_encoded_key;
   GHashTable *value_to_index;
   off_t offset;
 } SaveIndexedCtx;
@@ -65,8 +68,16 @@ void *read_elem(int fd, DecodeFunc decode_func, off_t *offset) {
 
 void save_entry(void *key, void *value, void *data) {
   SaveCtx *ctx = data;
-  write_elem(ctx->fd, ctx->encode_key(key), &ctx->offset);
-  write_elem(ctx->fd, ctx->encode_val(value), &ctx->offset);
+  Bytes key_bytes = ctx->encode_key(key);
+  Bytes val_bytes = ctx->encode_val(value);
+
+  write_elem(ctx->fd, key_bytes, &ctx->offset);
+  write_elem(ctx->fd, val_bytes, &ctx->offset);
+
+  if (ctx->free_encoded_key)
+    free(key_bytes.data);
+  if (ctx->free_encoded_val)
+    free(val_bytes.data);
 }
 
 static size_t get_or_create_value_index(GHashTable *value_to_index,
@@ -94,8 +105,12 @@ static void save_indexed_entry(void *key, void *value, void *data) {
     return;
 
   size_t idx = GPOINTER_TO_SIZE(stored) - 1;
-  write_elem(ctx->fd, ctx->encode_key(key), &ctx->offset);
+  Bytes key_bytes = ctx->encode_key(key);
+  write_elem(ctx->fd, key_bytes, &ctx->offset);
   write_elem(ctx->fd, encode_size_elem(&idx), &ctx->offset);
+
+  if (ctx->free_encoded_key)
+    free(key_bytes.data);
 }
 
 static void save_values_array(const char *path, GArray *values,
@@ -147,7 +162,8 @@ static GArray *load_values_array(const char *path, DecodeFunc decode_value) {
 }
 
 void ghash_save(const char *path, GHashTable *ht, EncodeFunc encode_key,
-                EncodeFunc encode_val) {
+                EncodeFunc encode_val, gboolean free_encoded_key,
+                gboolean free_encoded_val) {
   int fd = open(path, O_WRONLY | O_CREAT | O_TRUNC, 0644);
   if (fd < 0)
     return;
@@ -160,7 +176,8 @@ void ghash_save(const char *path, GHashTable *ht, EncodeFunc encode_key,
   }
   offset += sizeof(n);
 
-  SaveCtx ctx = {fd, encode_key, encode_val, offset};
+  SaveCtx ctx = {fd, encode_key, encode_val, free_encoded_key, free_encoded_val,
+                 offset};
   g_hash_table_foreach(ht, save_entry, &ctx);
 
   close(fd);
@@ -194,8 +211,10 @@ GHashTable *ghash_load(const char *path, GHashFunc hash_fn, GEqualFunc equal_fn,
 
 void ghash_save_indexed_pair(const char *table1_path, const char *table2_path,
                              const char *values_path, GHashTable *table1,
-                             GHashTable *table2, EncodeFunc encode_key1,
-                             EncodeFunc encode_key2, EncodeFunc encode_value) {
+                             GHashTable *table2,
+                             IndexedTableSaveConfig config1,
+                             IndexedTableSaveConfig config2,
+                             EncodeFunc encode_value) {
   GHashTable *value_to_index = g_hash_table_new(g_direct_hash, g_direct_equal);
   GArray *values = g_array_new(FALSE, FALSE, sizeof(gpointer));
   IndexedValueCtx values_ctx = {value_to_index, values};
@@ -211,7 +230,8 @@ void ghash_save_indexed_pair(const char *table1_path, const char *table2_path,
     off_t offset = 0;
     if (pwrite(fd1, &n, sizeof(n), offset) == sizeof(n)) {
       offset += sizeof(n);
-      SaveIndexedCtx ctx = {fd1, encode_key1, value_to_index, offset};
+      SaveIndexedCtx ctx = {fd1, config1.encode_key, config1.free_encoded_key,
+                            value_to_index, offset};
       g_hash_table_foreach(table1, save_indexed_entry, &ctx);
     }
     close(fd1);
@@ -223,7 +243,8 @@ void ghash_save_indexed_pair(const char *table1_path, const char *table2_path,
     off_t offset = 0;
     if (pwrite(fd2, &n, sizeof(n), offset) == sizeof(n)) {
       offset += sizeof(n);
-      SaveIndexedCtx ctx = {fd2, encode_key2, value_to_index, offset};
+      SaveIndexedCtx ctx = {fd2, config2.encode_key, config2.free_encoded_key,
+                            value_to_index, offset};
       g_hash_table_foreach(table2, save_indexed_entry, &ctx);
     }
     close(fd2);
@@ -235,23 +256,21 @@ void ghash_save_indexed_pair(const char *table1_path, const char *table2_path,
 
 IndexedPairTables ghash_load_indexed_pair(
     const char *table1_path, const char *table2_path, const char *values_path,
-    GHashFunc hash1_fn, GEqualFunc equal1_fn, DecodeFunc decode_key1,
-    GDestroyNotify free_key1, GHashFunc hash2_fn, GEqualFunc equal2_fn,
-    DecodeFunc decode_key2, GDestroyNotify free_key2, DecodeFunc decode_value,
-    GDestroyNotify free_value) {
+    IndexedTableLoadConfig config1, IndexedTableLoadConfig config2,
+    DecodeFunc decode_value, GDestroyNotify free_value) {
   IndexedPairTables result = {
-      g_hash_table_new_full(hash1_fn, equal1_fn, free_key1, NULL),
-      g_hash_table_new_full(hash2_fn, equal2_fn, free_key2, NULL)};
+      g_hash_table_new_full(config1.hash_fn, config1.equal_fn, config1.free_key,
+                            free_value),
+      g_hash_table_new_full(config2.hash_fn, config2.equal_fn, config2.free_key,
+                            free_value)};
 
   GArray *values = load_values_array(values_path, decode_value);
   GHashTable *table1_idx =
-      ghash_load(table1_path, hash1_fn, equal1_fn, decode_key1,
-                 decode_size_elem, NULL, g_free);
+      ghash_load(table1_path, config1.hash_fn, config1.equal_fn,
+                 config1.decode_key, decode_size_elem, NULL, g_free);
   GHashTable *table2_idx =
-      ghash_load(table2_path, hash2_fn, equal2_fn, decode_key2,
-                 decode_size_elem, NULL, g_free);
-
-  gboolean *used_values = calloc(values->len, sizeof(gboolean));
+      ghash_load(table2_path, config2.hash_fn, config2.equal_fn,
+                 config2.decode_key, decode_size_elem, NULL, g_free);
 
   GHashTableIter iter;
   void *key;
@@ -261,13 +280,12 @@ IndexedPairTables ghash_load_indexed_pair(
   while (g_hash_table_iter_next(&iter, &key, &value)) {
     size_t idx = *(size_t *)value;
     if (idx >= values->len) {
-      if (free_key1 != NULL)
-        free_key1(key);
+      if (config1.free_key != NULL)
+        config1.free_key(key);
       continue;
     }
 
     void *shared_value = g_array_index(values, gpointer, idx);
-    used_values[idx] = TRUE;
     g_hash_table_insert(result.table1, key, shared_value);
   }
 
@@ -275,17 +293,15 @@ IndexedPairTables ghash_load_indexed_pair(
   while (g_hash_table_iter_next(&iter, &key, &value)) {
     size_t idx = *(size_t *)value;
     if (idx >= values->len) {
-      if (free_key2 != NULL)
-        free_key2(key);
+      if (config2.free_key != NULL)
+        config2.free_key(key);
       continue;
     }
 
     void *shared_value = g_array_index(values, gpointer, idx);
-    used_values[idx] = TRUE;
     g_hash_table_insert(result.table2, key, shared_value);
   }
 
-  free(used_values);
   g_array_free(values, TRUE);
   g_hash_table_destroy(table1_idx);
   g_hash_table_destroy(table2_idx);
