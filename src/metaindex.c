@@ -9,35 +9,29 @@
 
 #define TABLE_PATH_HASH_TO_MASTER "/table_path_hash_to_master"
 #define TABLE_PATH_FILE_TO_MASTER "/table_path_file_to_master"
+#define TABLE_PATH_MASTER_INFOS "/table_path_master_infos"
 #define TABLE_PATH_FILE_TO_SIZES "/table_path_file_to_sizes"
 #define TABLE_PATH_FREE_BLOCK_LIST "/table_path_free_block_list"
-
-static GHashTable *loaded_hash_to_master = NULL;
 
 Bytes encode_master_info(void *elem) {
   return (Bytes){elem, sizeof(MasterInfo)};
 }
 
 void *decode_master_info(void *data, int size) {
-  if (size == sizeof(MasterInfo)) {
-    MasterInfo *m = malloc(sizeof(MasterInfo));
-    memcpy(m, data, sizeof(MasterInfo));
-    return m;
-  }
+  if (size != sizeof(MasterInfo))
+    return NULL;
 
-  // Get the MasterInfo through the hash_to_master table (this needs to be done
-  // because they have a shared value)
-  if (size == HASH_SIZE && loaded_hash_to_master != NULL) {
-    return g_hash_table_lookup(loaded_hash_to_master, data);
-  }
-
-  return NULL;
+  MasterInfo *m = malloc(sizeof(MasterInfo));
+  memcpy(m, data, sizeof(MasterInfo));
+  return m;
 }
 
 Bytes encode_hash(void *elem) { return (Bytes){elem, HASH_SIZE}; }
 
 void *decode_hash(void *data, int size) {
-  (void)size;
+  if (size != HASH_SIZE)
+    return NULL;
+
   char *hash = malloc(HASH_SIZE);
   memcpy(hash, data, HASH_SIZE);
   return hash;
@@ -148,20 +142,22 @@ static void block_indice_free(void *data) {
 Index *index_init(void) {
   Index *index = malloc(sizeof(Index));
 
+  IndexedTableLoadConfig config1 = {hash512_hash, hash512_equal, decode_hash,
+                                    g_free};
+  IndexedTableLoadConfig config2 = {blockIndice_hash, blockIndice_equal,
+                                    decode_block_indice, block_indice_free};
+
+  IndexedPairTables indexed_tables = ghash_load_indexed_pair(
+      TABLE_PATH_HASH_TO_MASTER, TABLE_PATH_FILE_TO_MASTER,
+      TABLE_PATH_MASTER_INFOS, config1, config2, decode_master_info, NULL);
+
   // hash_to_master: key = g_memdup'd hash (freed by g_free),
-  //                 value = MasterInfo* (NOT freed by table managed by
-  //                 refcount)
-  index->hash_to_master =
-      ghash_load(TABLE_PATH_HASH_TO_MASTER, hash512_hash, hash512_equal,
-                 decode_hash, decode_master_info, g_free, NULL);
+  //                 value = shared MasterInfo* (freed in index_destroy)
+  index->hash_to_master = indexed_tables.table1;
 
   // file_to_master: key = BlockIndice* (freed by block_indice_free),
-  //                 value = MasterInfo* (NOT freed by table)
-  loaded_hash_to_master = index->hash_to_master;
-  index->file_to_master = ghash_load(
-      TABLE_PATH_FILE_TO_MASTER, blockIndice_hash, blockIndice_equal,
-      decode_block_indice, decode_master_info, block_indice_free, NULL);
-  loaded_hash_to_master = NULL;
+  //                 value = shared MasterInfo* (owned by hash_to_master set)
+  index->file_to_master = indexed_tables.table2;
 
   index->file_to_sizes =
       ghash_load(TABLE_PATH_FILE_TO_SIZES, g_str_hash, g_str_equal, decode_str,
@@ -178,15 +174,17 @@ Index *index_init(void) {
 void index_destroy(Index *index) {
   pthread_mutex_lock(&index->mutex);
 
-  ghash_save(TABLE_PATH_HASH_TO_MASTER, index->hash_to_master, encode_hash,
-             encode_master_info);
-  // Here we encode the MasterInfo(hash is the first element of the struct) with
-  // the encode_hash to be able to use the hash to lookup the value in the
-  // hash_to_master table to ensure the shared value of the two tables
-  ghash_save(TABLE_PATH_FILE_TO_MASTER, index->file_to_master,
-             encode_block_indice, encode_hash);
+  // encode_hash doesn't allocate, so free_encoded_key=FALSE
+  IndexedTableSaveConfig config1 = {encode_hash, FALSE};
+  // encode_block_indice allocates memory, so free_encoded_key=TRUE
+  IndexedTableSaveConfig config2 = {encode_block_indice, TRUE};
+
+  ghash_save_indexed_pair(TABLE_PATH_HASH_TO_MASTER, TABLE_PATH_FILE_TO_MASTER,
+                          TABLE_PATH_MASTER_INFOS, index->hash_to_master,
+                          index->file_to_master, config1, config2,
+                          encode_master_info);
   ghash_save(TABLE_PATH_FILE_TO_SIZES, index->file_to_sizes, encode_str,
-             encode_size);
+             encode_size, FALSE, FALSE);
   gslist_save(TABLE_PATH_FREE_BLOCK_LIST, index->free_block_list,
               encode_free_block);
 
