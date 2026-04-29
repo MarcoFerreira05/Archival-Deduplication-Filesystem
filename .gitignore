@@ -4,6 +4,7 @@ passthrough
 build
 .vscode/c_cpp_properties.json
 *.md
+!docs/*.md
 .claude
 *.o
 bpf_programs/cachestat/cachestat
