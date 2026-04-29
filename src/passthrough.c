@@ -32,6 +32,7 @@
 /* For pread()/pwrite()/utimensat() */
 #define _XOPEN_SOURCE 700
 #endif
+#include "alloc_policy.h"
 #include "dedup.h"
 #include <dirent.h>
 #include <errno.h>
@@ -72,6 +73,7 @@ typedef struct context {
   Index *index;
   int masterFd;
   uint64_t nextBlockIndex;
+  AllocConfig alloc_config;     // política de alocação carregada de env vars
 } Context;
 #endif
 
@@ -105,6 +107,12 @@ static void *xmp_init(struct fuse_conn_info *conn, struct fuse_config *cfg) {
   struct stat stbuf;
   lstat("/masterFILE", &stbuf);
   ctx->nextBlockIndex = stbuf.st_size / BLOCK_SIZE;
+
+  // Carrega a política de alocação a partir de variáveis de ambiente
+  // (DEDUP_ALLOC_POLICY, DEDUP_THRESHOLD, DEDUP_MAX_FRAGMENTS) e
+  // regista a configuração escolhida para correlação com benchmarks.
+  alloc_config_load_from_env(&ctx->alloc_config);
+  alloc_config_log(&ctx->alloc_config);
 
 #ifdef DEBUG
   ctx->open = 0;
@@ -517,8 +525,8 @@ static int xmp_write(const char *path, const char *buf, size_t size,
 
   // write through the dedup layer (handles dedup + overwrite)
   pthread_mutex_lock(&p_ctx->index->mutex);
-  res = write_dedup(p_ctx->index, path, buf, size, offset, p_ctx->masterFd,
-                    &p_ctx->nextBlockIndex);
+  res = write_dedup(p_ctx->index, &p_ctx->alloc_config, path, buf, size, offset,
+                    p_ctx->masterFd, &p_ctx->nextBlockIndex);
   pthread_mutex_unlock(&p_ctx->index->mutex);
 
   if (fi == NULL)

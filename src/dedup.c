@@ -49,6 +49,7 @@
 #include <sys/xattr.h>
 #endif
 
+#include "alloc_policy.h"
 #include "dedup.h"
 #include "freelist.h"
 #include "hashing.h"
@@ -133,24 +134,19 @@ typedef struct {
 } PlanEntry;
 
 // -----------------------------------------------------------------------------
-// Allocator storage-first
+// Allocators — uma função por filosofia + um switch unificado.
 // -----------------------------------------------------------------------------
-//
-// Filosofia: usar SEMPRE a free list antes de fazer append. Mesmo que os
-// extents sejam pequenos, são consumidos antes de o master crescer.
+
+// Storage-first: drena sempre a free list antes de fazer append. O master
+// nunca cresce enquanto houver slots livres.
 //
 // Estratégia:
-//   - Se a free list tem >= miss_count slots livres, todos vêm de lá.
-//   - Caso contrário, drena tudo o que houver e faz append do remainder.
-//
-// O `freelist_take` faz best-fit por varrimento: tenta encontrar um único
-// extent que sirva, e se não existir parte por vários extents (consumindo
-// o maior em primeiro lugar). A ordem dos master_blk em `out` é a ordem em
-// que foram tirados — pode não ser estritamente crescente, mas runs
-// contíguos dentro do mesmo extent saem ordenados.
-static void allocate_batch_storage_first(Index *idx, uint64_t miss_count,
-                                          uint64_t *next_block_index,
-                                          uint64_t *out) {
+//   - Se a free list tem >= miss_count slots livres, todos vêm de lá
+//     (best-fit por varrimento, possivelmente repartido por vários extents).
+//   - Caso contrário, drena tudo o que houver e completa por append.
+static void allocate_storage_first(Index *idx, uint64_t miss_count,
+                                    uint64_t *next_block_index,
+                                    uint64_t *out) {
   uint64_t total = freelist_total_free(&idx->free_list);
 
   if (total >= miss_count) {
@@ -166,6 +162,55 @@ static void allocate_batch_storage_first(Index *idx, uint64_t miss_count,
   }
   for (uint64_t i = taken; i < miss_count; i++) {
     out[i] = (*next_block_index)++;
+  }
+}
+
+// Syscall-first: tenta minimizar o número de syscalls de escrita por
+// request, mesmo crescendo o master quando a free list está fragmentada.
+//
+// Estratégia em três níveis:
+//   1. Se existe um extent contínuo >= miss_count → 1 syscall garantido.
+//   2. Senão, se o maior extent disponível >= threshold → consome-o e
+//      completa por append. 2 syscalls.
+//   3. Senão, append puro ignora a free list → 1 syscall, mas o master
+//      cresce miss_count blocos.
+static void allocate_syscall_first(Index *idx, uint64_t miss_count,
+                                    uint64_t *next_block_index,
+                                    uint64_t threshold, uint64_t *out) {
+  // 1. Run contíguo grande o suficiente: caminho ideal.
+  if (freelist_take_if_exists_run(&idx->free_list, miss_count, out))
+    return;
+
+  // 2. Maior extent é "razoável": consome-o e completa por append.
+  Extent largest = freelist_largest(&idx->free_list);
+  if (largest.length >= threshold) {
+    uint64_t taken = freelist_take(&idx->free_list, largest.length, out);
+    for (uint64_t i = taken; i < miss_count; i++) {
+      out[i] = (*next_block_index)++;
+    }
+    return;
+  }
+
+  // 3. Free list demasiado fragmentada para esta filosofia: append puro.
+  // (A free list fica intacta — slots órfãos, mas o request resolve-se
+  //  numa única operação de pwritev.)
+  for (uint64_t i = 0; i < miss_count; i++) {
+    out[i] = (*next_block_index)++;
+  }
+}
+
+// Switch unificado: escolhe a implementação consoante a política activa.
+static void allocate_batch(Index *idx, const AllocConfig *cfg,
+                            uint64_t miss_count, uint64_t *next_block_index,
+                            uint64_t *out) {
+  switch (cfg->policy) {
+    case ALLOC_STORAGE_FIRST:
+      allocate_storage_first(idx, miss_count, next_block_index, out);
+      break;
+    case ALLOC_SYSCALL_FIRST:
+      allocate_syscall_first(idx, miss_count, next_block_index, cfg->threshold,
+                             out);
+      break;
   }
 }
 
@@ -270,8 +315,9 @@ static void rollback_allocations(Index *idx, PlanEntry *plan, size_t n,
 // write_dedup — entrada pública.
 // -----------------------------------------------------------------------------
 
-int write_dedup(Index *index, const char *path, const char *buf, size_t size,
-                off_t offset, int masterFd, uint64_t *nextBlockIndex) {
+int write_dedup(Index *index, const AllocConfig *cfg, const char *path,
+                const char *buf, size_t size, off_t offset, int masterFd,
+                uint64_t *nextBlockIndex) {
   // Caso degenerado: write de 0 bytes não faz nada.
   if (size == 0)
     return 0;
@@ -353,8 +399,7 @@ int write_dedup(Index *index, const char *path, const char *buf, size_t size,
     uint64_t *master_blks =
         miss_count <= 256 ? master_blks_stack : g_new(uint64_t, miss_count);
 
-    allocate_batch_storage_first(index, miss_count, nextBlockIndex,
-                                  master_blks);
+    allocate_batch(index, cfg, miss_count, nextBlockIndex, master_blks);
 
     // Preenche master_blk em cada PlanEntry MISS, na ordem em que apareceram.
     size_t m = 0;

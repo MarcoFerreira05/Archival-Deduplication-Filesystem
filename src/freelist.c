@@ -67,6 +67,12 @@ static void tree_insert(GTree *tree, Extent *extent) {
   g_tree_insert(tree, key, extent);
 }
 
+// Forward declaration: consume_from_extent é definido abaixo, junto à
+// implementação de freelist_take, mas é usado também pelo
+// freelist_take_if_exists_run (que vem antes).
+static uint64_t consume_from_extent(GTree *tree, Extent *extent,
+                                     uint64_t consumed);
+
 // -----------------------------------------------------------------------------
 // Ciclo de vida
 // -----------------------------------------------------------------------------
@@ -105,6 +111,60 @@ uint64_t freelist_total_free(FreeList *fl) {
   sum_state_t s = { .total = 0 };
   g_tree_foreach(fl->by_start, sum_lengths_cb, &s);
   return s.total;
+}
+
+// Estado partilhado pelo callback que procura o maior extent.
+typedef struct {
+  Extent *largest;
+} largest_state_t;
+
+static gboolean find_largest_cb(gpointer key, gpointer value, gpointer data) {
+  (void)key;
+  Extent *e = (Extent *)value;
+  largest_state_t *s = (largest_state_t *)data;
+  if (s->largest == NULL || e->length > s->largest->length) {
+    s->largest = e;
+  }
+  return FALSE;  // continuar
+}
+
+Extent freelist_largest(FreeList *fl) {
+  largest_state_t s = { .largest = NULL };
+  g_tree_foreach(fl->by_start, find_largest_cb, &s);
+  if (s.largest == NULL) {
+    return (Extent){ .start = 0, .length = 0 };
+  }
+  return *s.largest;
+}
+
+// Estado para procurar especificamente um extent que sirva para um run de K.
+typedef struct {
+  uint64_t k;
+  Extent *fit;  // primeiro extent encontrado com length >= k (NULL se nenhum)
+} fit_state_t;
+
+static gboolean find_fit_cb(gpointer key, gpointer value, gpointer data) {
+  (void)key;
+  Extent *e = (Extent *)value;
+  fit_state_t *s = (fit_state_t *)data;
+  if (e->length >= s->k) {
+    s->fit = e;
+    return TRUE;  // basta o primeiro que sirva
+  }
+  return FALSE;
+}
+
+gboolean freelist_take_if_exists_run(FreeList *fl, uint64_t k, uint64_t *out) {
+  fit_state_t s = { .k = k, .fit = NULL };
+  g_tree_foreach(fl->by_start, find_fit_cb, &s);
+  if (s.fit == NULL) {
+    return FALSE;
+  }
+  uint64_t start = consume_from_extent(fl->by_start, s.fit, k);
+  for (uint64_t i = 0; i < k; i++) {
+    out[i] = start + i;
+  }
+  return TRUE;
 }
 
 // -----------------------------------------------------------------------------

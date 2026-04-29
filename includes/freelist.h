@@ -105,6 +105,18 @@ void freelist_release_run(FreeList *fl, uint64_t start, uint64_t length);
 // freelist tem o suficiente para um batch antes de chamar `freelist_take`.
 uint64_t freelist_total_free(FreeList *fl);
 
+// Devolve o maior extent disponível. Se a free list estiver vazia, devolve
+// `(0, 0)`. Útil para a política syscall-first decidir se vale a pena
+// consumir um extent ou fazer append puro.
+Extent freelist_largest(FreeList *fl);
+
+// Caso especializado: se existir um extent com length >= k, consome k blocos
+// do início desse extent (preenchendo out[0..k-1] com slots contíguos) e
+// devolve TRUE. Caso contrário, devolve FALSE sem alterar o estado da
+// freelist. Esta operação é exactamente o "1 syscall garantido" da política
+// syscall-first.
+gboolean freelist_take_if_exists_run(FreeList *fl, uint64_t k, uint64_t *out);
+
 // -----------------------------------------------------------------------------
 // Persistência
 // -----------------------------------------------------------------------------
