@@ -207,15 +207,99 @@ uint64_t freelist_take(FreeList *fl, uint64_t k, uint64_t *out) {
 }
 
 // -----------------------------------------------------------------------------
-// Release (Commit 1: sem coalescing — cada slot é um Extent isolado)
+// Release com coalescing — junta o slot libertado com vizinhos adjacentes.
 // -----------------------------------------------------------------------------
 //
-// O coalescing real (juntar com vizinhos adjacentes) será adicionado no
-// Commit 3. Esta versão simples é semanticamente equivalente à GSList
-// actual: cada slot libertado fica como um extent isolado de length=1.
+// Quando um slot X é libertado, há quatro situações possíveis quanto aos
+// extents existentes:
 //
-// TODO: coalescing
+//   Caso A: nenhum vizinho adjacente
+//           → criar um Extent novo (X, 1).
+//
+//   Caso B: existe um predecessor PRED com PRED.start + PRED.length == X
+//           (extent que termina exactamente em X-1)
+//           → estender PRED em 1 (length++); start não muda, sem re-insert.
+//
+//   Caso C: existe um sucessor SUC com SUC.start == X+1
+//           (extent que começa exactamente em X+1)
+//           → o slot novo vira o início do SUC: start--, length++.
+//             Como a chave do GTree é o start, temos de remover e re-inserir.
+//
+//   Caso D: ambos existem
+//           → PRED absorve o slot novo + o SUC inteiro:
+//                PRED.length += 1 + SUC.length
+//             SUC é removido do GTree.
+//
+// É este caso D que faz com que apagar um ficheiro de 100 blocos consecutivos
+// produza 1 extent de tamanho 100 em vez de 100 extents soltos: cada release
+// encontra o predecessor (que cresceu 1 no release anterior) e absorve.
+
+// Estado do walk usado para encontrar o predecessor mais próximo de X.
+// O predecessor é o extent com o maior `start` que ainda seja < X.
+typedef struct {
+  uint64_t x;
+  Extent *candidate;     // melhor predecessor encontrado até agora
+} pred_search_t;
+
+static gboolean find_pred_cb(gpointer key, gpointer value, gpointer data) {
+  Extent *e = (Extent *)value;
+  pred_search_t *s = (pred_search_t *)data;
+  uint64_t start = *(uint64_t *)key;
+
+  if (start >= s->x) {
+    // Já ultrapassámos X — o último candidato (se houver) é o predecessor.
+    return TRUE;  // TRUE = parar a iteração
+  }
+  s->candidate = e;
+  return FALSE;
+}
+
+// Procura o extent que termine adjacente a X (i.e., extent.start + extent.length == X).
+// Retorna NULL se não houver.
+static Extent *find_adjacent_predecessor(GTree *by_start, uint64_t x) {
+  pred_search_t s = { .x = x, .candidate = NULL };
+  g_tree_foreach(by_start, find_pred_cb, &s);
+  if (s.candidate && s.candidate->start + s.candidate->length == x) {
+    return s.candidate;
+  }
+  return NULL;
+}
+
 void freelist_release(FreeList *fl, uint64_t master_blk) {
+  // Procurar o sucessor adjacente: extent que comece em X+1.
+  uint64_t suc_key = master_blk + 1;
+  Extent *suc = g_tree_lookup(fl->by_start, &suc_key);
+
+  // Procurar o predecessor adjacente: extent que termine em X-1.
+  Extent *pred = find_adjacent_predecessor(fl->by_start, master_blk);
+
+  if (pred && suc) {
+    // Caso D: pred absorve o slot novo + o sucessor inteiro.
+    // pred.start não muda, pred.length cresce; sucessor é removido.
+    pred->length += 1 + suc->length;
+    g_tree_remove(fl->by_start, &suc->start);  // liberta key e Extent do suc
+    return;
+  }
+
+  if (pred) {
+    // Caso B: pred estende-se em 1. start não muda, sem re-insert.
+    pred->length++;
+    return;
+  }
+
+  if (suc) {
+    // Caso C: o slot novo vira o início do sucessor. Como a chave do GTree é
+    // o start, temos de criar um Extent substituto e re-inserir (não há
+    // forma leve de mutar uma chave em sítio em glib).
+    Extent *replacement = g_new(Extent, 1);
+    replacement->start = master_blk;
+    replacement->length = suc->length + 1;
+    g_tree_remove(fl->by_start, &suc->start);  // liberta o suc antigo
+    tree_insert(fl->by_start, replacement);
+    return;
+  }
+
+  // Caso A: sem vizinhos. Cria-se um Extent novo de tamanho 1.
   Extent *e = g_new(Extent, 1);
   e->start = master_blk;
   e->length = 1;
