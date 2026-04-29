@@ -56,6 +56,10 @@ IndexedPairTables ghash_load_indexed_pair(
     IndexedTableLoadConfig config1, IndexedTableLoadConfig config2,
     DecodeFunc decode_value, GDestroyNotify free_value);
 
+// TODO: gslist_save/gslist_load eram usadas pela free list antiga (substituída
+// pelo módulo `freelist`). Não há outros utilizadores actuais; manter por
+// agora caso outros módulos persistam GSList no futuro. Se permanecerem sem
+// uso após algumas iterações, remover.
 void gslist_save(const char *path, GSList *list, EncodeFunc encode_elem);
 GSList *gslist_load(const char *path, DecodeFunc decode_elem);
 

@@ -46,9 +46,6 @@ void *decode_hash(void *data, int size);
 Bytes encode_block_indice(void *elem);
 void *decode_block_indice(void *data, int size);
 
-Bytes encode_free_block(void *elem);
-void *decode_free_block(void *data, int size);
-
 Bytes encode_size(void *elem);
 void *decode_size(void *data, int size);
 

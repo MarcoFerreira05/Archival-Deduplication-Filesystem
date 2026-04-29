@@ -108,7 +108,7 @@ uint64_t freelist_total_free(FreeList *fl) {
 }
 
 // -----------------------------------------------------------------------------
-// Best-fit por varrimento (Commit 1: simples e suficiente)
+// Best-fit por varrimento (suficiente enquanto F é pequeno)
 // -----------------------------------------------------------------------------
 //
 // FUTURE WORK — Fase 3: índice secundário by_length para best-fit O(log F).

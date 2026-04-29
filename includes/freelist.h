@@ -88,13 +88,13 @@ void freelist_destroy(FreeList *fl);
 // k -= consumido até esgotar o pedido ou a freelist.
 uint64_t freelist_take(FreeList *fl, uint64_t k, uint64_t *out);
 
-// Devolve um bloco isolado à freelist. NESTA FASE DO REFACTOR (Commit 1)
-// não faz coalescing — cada slot vira um Extent(X, 1). O coalescing é
-// adicionado no Commit 3.
+// Devolve um bloco isolado à freelist, fundindo com vizinhos adjacentes
+// se existirem (coalescing on release). Custo O(log F) — ver freelist.c
+// para os 4 casos (sem vizinhos / só pred / só suc / ambos).
 void freelist_release(FreeList *fl, uint64_t master_blk);
 
-// Devolve um run inteiro de slots à freelist. Nesta fase, equivalente a
-// chamar `freelist_release` em loop.
+// Devolve um run inteiro de slots à freelist. Implementado como
+// freelist_release em loop, beneficia automaticamente do coalescing.
 void freelist_release_run(FreeList *fl, uint64_t start, uint64_t length);
 
 // -----------------------------------------------------------------------------
@@ -106,9 +106,14 @@ void freelist_release_run(FreeList *fl, uint64_t start, uint64_t length);
 uint64_t freelist_total_free(FreeList *fl);
 
 // -----------------------------------------------------------------------------
-// Persistência (stubs nesta fase — implementação real no Commit 4)
+// Persistência
 // -----------------------------------------------------------------------------
-
+//
+// Formato em disco: header com nº de extents, seguido de pares
+// (start, length) prefixados pelo tamanho do payload (ver freelist.c).
+// O `freelist_load` detecta automaticamente o formato antigo (slots
+// individuais como uint64_t) e migra-o para o formato novo via release
+// + coalescing.
 void freelist_save(const char *path, FreeList *fl);
 void freelist_load(const char *path, FreeList *fl);
 

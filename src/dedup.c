@@ -105,8 +105,8 @@ void remove_block_dedup(Index *index, const char *path, uint64_t blockIndex) {
   info->refcount--;
 
   // Se mais ninguém referencia este bloco, devolve o slot à free list.
-  // Com o módulo `freelist` a lidar com a estrutura, esta operação é
-  // O(log F) hoje e converte-se em coalescing real no Commit 3.
+  // O freelist_release faz coalescing com vizinhos adjacentes
+  // automaticamente (ver freelist.c).
   if (info->refcount == 0) {
     freelist_release(&index->free_list, info->masterBlockIndex);
     remove_hash(index, info->hash);
@@ -254,7 +254,7 @@ static void rollback_allocations(Index *idx, PlanEntry *plan, size_t n,
 
   // Reverter MISSes: devolver master_blk à free list, libertar MasterInfo
   // pendente. A free list aceita slots em qualquer ordem; o coalescing
-  // (Commit 3) tratará de juntá-los se forem adjacentes.
+  // funde-os automaticamente se forem adjacentes.
   for (size_t i = 0; i < n; i++) {
     if (plan[i].kind == PLAN_MISS) {
       freelist_release(&idx->free_list, plan[i].master_blk);
