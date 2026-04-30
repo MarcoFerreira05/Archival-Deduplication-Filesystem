@@ -13,3 +13,7 @@ bpf_programs/syscounter/syscounter
 bpf_programs/syscounter/syscounter.skel.h
 bpf_programs/syscounter/vmlinux.h
 */__pycache__/*
+
+# Benchmark artifacts
+results/
+benchmarks/config_save.json
