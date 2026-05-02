@@ -26,19 +26,10 @@
 #include "metaindex.h"
 #include "passthrough_helpers.h"
 
-typedef struct {
-  size_t logical_idx;
-  uint64_t master_block_index;
-} BlockPair;
-
 static int cmp_master_idx(const void *a, const void *b) {
   uint64_t ma = ((const BlockPair *)a)->master_block_index;
   uint64_t mb = ((const BlockPair *)b)->master_block_index;
-  if (ma < mb)
-    return -1;
-  if (ma > mb)
-    return 1;
-  return 0;
+  return (ma > mb) - (ma < mb);
 }
 
 // Read file with batching optimization.
@@ -52,61 +43,72 @@ int read_dedup(Index *index, const char *path, char *buf, size_t size,
   size_t num_blocks = size / BLOCK_SIZE;
   uint64_t start_block = offset / BLOCK_SIZE;
 
-  // Phase 1: Lookup all blocks and create pairs
-  MasterInfo *infos[num_blocks];
-  BlockPair pairs[num_blocks];
+  if (num_blocks == 0)
+    return 0;
 
+  // Phase 1: Lookup all blocks and create pairs
+  BlockPair pairs[num_blocks];
   for (size_t i = 0; i < num_blocks; i++) {
-    infos[i] = lookup_by_file_block(index, path, start_block + i);
-    if (infos[i] == NULL) {
+    MasterInfo *info = lookup_by_file_block(index, path, start_block + i);
+    if (info == NULL) {
       return -1;
     }
     pairs[i].logical_idx = i;
-    pairs[i].master_block_index = infos[i]->masterBlockIndex;
+    pairs[i].master_block_index = info->masterBlockIndex;
   }
 
   // Phase 2: Sort pairs by master block index
-  qsort(pairs, num_blocks, sizeof(BlockPair), cmp_master_idx);
+  if (num_blocks <= INSERTION_SORT_THRESHOLD) {
+    insertion_sort(pairs, num_blocks);
+  } else {
+    qsort(pairs, num_blocks, sizeof(BlockPair), cmp_master_idx);
+  }
 
   // Allocate single buffer for all reads not one per group
   char *master_buf = malloc(num_blocks * BLOCK_SIZE);
-  if (master_buf == NULL)
-    return -1;
 
   // Phase 3 & 4: Identify groups and read them
   size_t group_start = 0;
   for (size_t i = 1; i <= num_blocks; i++) {
     int is_last = (i == num_blocks);
+
     int is_consec = !is_last && (pairs[i].master_block_index ==
                                  pairs[i - 1].master_block_index + 1);
-
     if (!is_last && is_consec)
       continue;
 
     // End of current group - read it
     uint64_t min_master = pairs[group_start].master_block_index;
-    uint64_t max_master = pairs[i - 1].master_block_index;
-    size_t read_size = (max_master - min_master + 1) * BLOCK_SIZE;
+    size_t blocks_in_group = i - group_start;
 
-    ssize_t res =
-        pread(masterFd, master_buf, read_size, min_master * BLOCK_SIZE);
-    if (res == -1) {
-      free(master_buf);
-      return -1;
-    }
-
-    // Phase 5: Copy each block to correct position in output
-    for (size_t j = group_start; j < i; j++) {
-      size_t logical_idx = pairs[j].logical_idx;
-      uint64_t offset_in_range = pairs[j].master_block_index - min_master;
-      char *src = master_buf + offset_in_range * BLOCK_SIZE;
+    // Fast path: single block group
+    if (blocks_in_group == 1) {
+      size_t logical_idx = pairs[group_start].logical_idx;
       char *dst = buf + logical_idx * BLOCK_SIZE;
-      memcpy(dst, src, BLOCK_SIZE);
+      ssize_t res = pread(masterFd, dst, BLOCK_SIZE, min_master * BLOCK_SIZE);
+      if (res != BLOCK_SIZE) {
+        free(master_buf);
+        return -1;
+      }
+    } else {
+      size_t read_size = blocks_in_group * BLOCK_SIZE;
+      ssize_t res =
+          pread(masterFd, master_buf, read_size, min_master * BLOCK_SIZE);
+      if (res != (ssize_t)read_size) {
+        free(master_buf);
+        return -1;
+      }
+      // Phase 5: Copy each block to correct position in output
+      for (size_t j = group_start; j < i; j++) {
+        size_t logical_idx = pairs[j].logical_idx;
+        uint64_t offset_in_range = pairs[j].master_block_index - min_master;
+        char *src = master_buf + offset_in_range * BLOCK_SIZE;
+        char *dst = buf + logical_idx * BLOCK_SIZE;
+        memcpy(dst, src, BLOCK_SIZE);
+      }
     }
-
     group_start = i;
   }
-
   free(master_buf);
   return size;
 }
