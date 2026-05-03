@@ -1,27 +1,28 @@
 import sys
 import re
-from csv import DictReader, writer
+import json
+from csv import DictReader
 from statistics import mean, stdev
 
 argc = len(sys.argv)
 command_regex: str = ""
 input_csvs: list[str] = []
-output_csv: str = ""
+output_json: str = ""
 aggregator_time: dict[str, list[int]] = {}
 aggregator_count: dict[str, list[int]] = {}
 
 
 def parse_args() -> bool:
-    global argc, command_regex, input_csvs, output_csv
+    global argc, command_regex, input_csvs, output_json
 
     if argc < 3:
-        print("Usage: python3 process_csv.py <command_regex> <list_input_CSVs> <output_CSV>")
+        print("Usage: python3 csv_aggregator_syscounter.py <command_regex> <list_input_CSVs> <output_JSON>")
         return False
 
     command_regex = sys.argv[1]
     for i in range(2,argc-1):
         input_csvs.append(sys.argv[i])
-    output_csv = sys.argv[argc-1]
+    output_json = sys.argv[argc-1]
     
     return True
 
@@ -48,29 +49,24 @@ def process_file(file: str):
                     old_count.append(count)
 
 
-def prepare_output() -> tuple[list[str],list[str]]:
-    fields = []
-    data = []
+def prepare_output() -> dict:
+    output_dict = {}
 
     for syscall in aggregator_time:
-        fields.append(f"{syscall}_avg_time")
         times = aggregator_time[syscall]
         average = mean(times)
-        data.append(average)
+        output_dict[f"{syscall}_avg_time"] = average
         st_dev = stdev(times) if len(times) > 1 else 0.0
-        fields.append(f"{syscall}_stdev_time")
-        data.append(st_dev)
+        output_dict[f"{syscall}_stdev_time"] = st_dev
     
     for syscall in aggregator_count:
-        fields.append(f"{syscall}_avg_count")
         counts = aggregator_count[syscall]
         average = mean(counts)
-        data.append(average)
+        output_dict[f"{syscall}_avg_count"] = average
         st_dev = stdev(counts) if len(counts) > 1 else 0.0
-        fields.append(f"{syscall}_stdev_count")
-        data.append(st_dev)
+        output_dict[f"{syscall}_stdev_count"] = st_dev
 
-    return (fields, data)
+    return output_dict
 
 
 if not parse_args():
@@ -79,8 +75,6 @@ if not parse_args():
 for file in input_csvs:
     process_file(file)
 
-fields, data = prepare_output()
-with open(output_csv, "w", newline="") as out:
-    csv_writer = writer(out)
-    csv_writer.writerow(fields)
-    csv_writer.writerow(data)
+output_data = prepare_output()
+with open(output_json, "w") as out:
+    json.dump(output_data, out, indent=2)
