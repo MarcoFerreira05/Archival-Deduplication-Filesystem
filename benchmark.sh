@@ -101,7 +101,7 @@ if [[ "${1:-}" == "-h" || "${1:-}" == "--help" ]]; then
   exit 0
 fi
 
-timestamp="$(date +'%Y%m%d-%H%M%S')"
+timestamp="$(date +'%Y-%m-%d--%H-%M-%S')"
 OUTDIR="${1:-$ROOT/results/$timestamp}"
 mkdir -p "$OUTDIR"
 
@@ -136,6 +136,9 @@ log "Output dir: $OUTDIR"
 
 # Ensure sudo credentials are available early (so we don't block mid-run).
 sudo -v
+
+log "Dropping page cache (including dentries and inodes)"
+sudo sh -c 'sync; echo 3 > /proc/sys/vm/drop_caches' || die "Failed to drop page cache"
 
 log "Cleaning previous run data"
 "$ROOT/clean_fuse_data.sh" >"$OUTDIR/clean.log" 2>&1 || die "clean_fuse_data.sh failed (see $OUTDIR/clean.log)"
