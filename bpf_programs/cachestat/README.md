@@ -29,6 +29,7 @@ make
 sudo ./cachestat          # 1 second intervals
 sudo ./cachestat -T       # with timestamps
 sudo ./cachestat 1 10     # 10 samples, 1 second apart
+sudo ./cachestat --output stats.json 1 10   # write final global JSON stats on exit
 ```
 
 ## License
