@@ -58,8 +58,13 @@
 
 #define DEBUG "/tmp/debug.log"
 
-#ifdef DEBUG
 typedef struct context {
+  pthread_mutex_t mutex;
+  FILE *fp;
+  Index *index;
+  int masterFd;
+  uint64_t nextBlockIndex;
+#ifdef DEBUG
   uint64_t create;
   uint64_t open;
   uint64_t close;
@@ -67,13 +72,8 @@ typedef struct context {
   uint64_t read;
   uint64_t getattr;
   uint64_t unlink;
-  pthread_mutex_t mutex;
-  FILE *fp;
-  Index *index;
-  int masterFd;
-  uint64_t nextBlockIndex;
-} Context;
 #endif
+} Context;
 
 static int fill_dir_plus = 0;
 
