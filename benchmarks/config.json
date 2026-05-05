@@ -2,9 +2,9 @@
 	"write_pcnt": 49,
 	"read_pcnt": 49,
 	"unlink_pcnt": 2,
-	"dup_pcnt": 80,
+	"dup_pcnt": 75,
 	"block_range": [1,30],
-	"num_ops": 100000,
+	"num_ops": 200000,
 	"num_files": 1000,
 	"num_unique_dup_blocks": 200,
 	"test_file_path_format": "/mnt/fs/test_file{index}"
