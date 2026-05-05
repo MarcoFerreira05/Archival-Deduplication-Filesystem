@@ -1,5 +1,7 @@
 #include <signal.h>
 #include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
 #include <unistd.h>
 #include <bpf/libbpf.h>
 #include "syscounter.h"
@@ -172,10 +174,65 @@ void print_results(CounterKey *keys, CounterValue *values, int num_entries, char
 	printf("\n");
 }
 
+/* Function to write the results in CSV format to a file
+ * Receives an array of CounterKey (CounterKey *keys), an array of CounterValue (CounterValue *values),
+ * the number of entries in the arrays (int num_entries), an array of strings with the unique pid values
+ * (char (*pid_list)[COMM_STR_LEN]), the number of unique pid values (int pid_count), an array of integers with the unique
+ * op values (int *op_list), the number of unique op values (int op_count), and the output filename (const char *filename)
+ * as arguments. Writes the results in CSV format with columns: PID-Command, Syscall Name, Count, Avg Time (ns)
+ */
+void write_results_to_csv(CounterKey *keys, CounterValue *values, int num_entries, char (*pid_list)[COMM_STR_LEN], int pid_count,
+						  int *op_list, int op_count, const char *filename) {
+
+	FILE *file = fopen(filename, "w");
+	if (!file) {
+		fprintf(stderr, "Error: Failed to open file %s for writing\n", filename);
+		return;
+	}
+
+	fprintf(file, "PID-Command,Syscall Name,Count,Avg Time (ns)\n");
+
+	CounterValue total_by_op[MAX_OPS] = {0};
+	char comm[COMM_STR_LEN];
+
+	for (int j = 0; j < pid_count; j++) {
+		for (int i = 0; i < op_count; i++) {
+			CounterValue val = {0};
+			for (int k = 0; k < num_entries; k++) {
+				snprintf(comm, COMM_STR_LEN, "%s-%d", keys[k].command, keys[k].pid);
+				if ((strcmp(comm, pid_list[j]) == 0) && keys[k].op == op_list[i]) {
+					val = values[k];
+					total_by_op[i].count += val.count;
+					total_by_op[i].time_sum += val.time_sum;
+				}
+			}
+			if (val.count > 0) {
+				long avg_time_ns = val.time_sum / val.count;
+				fprintf(file, "%s,%s,%ld,%ld\n", pid_list[j], resolve_syscall(op_list[i]), val.count, avg_time_ns);
+			}
+		}
+	}
+
+	fprintf(file, "TOTAL,");
+	for (int i = 0; i < op_count; i++) {
+		long avg_time_ns = total_by_op[i].count ? (total_by_op[i].time_sum / total_by_op[i].count) : 0;
+		if (i == op_count - 1) {
+			fprintf(file, "%ld,%ld\n", total_by_op[i].count, avg_time_ns);
+		} else {
+			fprintf(file, "%ld,%ld,", total_by_op[i].count, avg_time_ns);
+		}
+	}
+
+	fclose(file);
+	printf("Results written to %s\n", filename);
+}
+
 
 int main(int argc, char *argv[]) {
     struct syscounter_bpf *skel;
     int err;
+	const char *csv_filename = NULL;
+	int pid_argc = argc;
 
 	/* Cleaner handling of Ctrl-C */
 	signal(SIGINT, sig_handler);
@@ -189,12 +246,26 @@ int main(int argc, char *argv[]) {
 
 	/* Configure a map with the pid to filter */
 	if (argc < 2) {
-		printf("usage: ./syscounter <pid>");
+		printf("usage: ./syscounter <pid1> [pid2 ...] [output_file.csv]\n");
+		goto cleanup;
 	}
 
-	// add the pids to filter to the my_config map. The key is the pid and the value is 1 (could be a char instead).
+	/* Check if last argument is a CSV filename (contains .csv or starts with a path) */
+	if (argc >= 3) {
+		const char *last_arg = argv[argc - 1];
+		/* Simple heuristic: if last arg doesn't parse as a number, treat it as filename */
+		char *endptr;
+		strtol(last_arg, &endptr, 10);
+		if (*endptr != '\0') {
+			/* Last argument is not purely numeric, treat as filename */
+			csv_filename = last_arg;
+			pid_argc = argc - 1;
+		}
+	}
+
+	/* add the pids to filter to the my_config map. The key is the pid and the value is 1 (could be a char instead) */
 	uint32_t key;
-	for (int i = 1; i < argc; i++) {
+	for (int i = 1; i < pid_argc; i++) {
 		key = atoi(argv[i]);
 		uint32_t value = 1;
 		bpf_map__update_elem(skel->maps.pids_to_consider, &key, sizeof(key), &value, sizeof(value), 0);
@@ -211,7 +282,7 @@ int main(int argc, char *argv[]) {
 
 	/* Process events until interrupted */
 	printf("Successfully started! Press Ctrl-C to stop and print results.\n");
-	// Use a very large sleep interval and rely on the signal handler to set exiting to true when Ctrl-C is pressed.
+	/* Use a very large sleep interval and rely on the signal handler to set exiting to true when Ctrl-C is pressed */
 	while (!exiting) {
         sleep(99999999);
 	}
@@ -228,6 +299,12 @@ int main(int argc, char *argv[]) {
 		int pid_count = get_unique_pid_values(keys, num_entries, pid_list);
 		int op_count = get_unique_op_values(keys, num_entries, op_list);
 		print_results(keys, values, num_entries, pid_list, pid_count, op_list, op_count);
+		
+		/* Write CSV output if filename was provided */
+		if (csv_filename) {
+			printf("\n");
+			write_results_to_csv(keys, values, num_entries, pid_list, pid_count, op_list, op_count, csv_filename);
+		}
 	}
 
 	free(keys);

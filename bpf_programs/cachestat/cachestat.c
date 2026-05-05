@@ -23,6 +23,7 @@ static struct env {
 	int times;
 	bool timestamp;
 	bool verbose;
+	const char *output;
 	int pids[MAX_PIDS];
 	int pid_count;
 } env = {
@@ -38,19 +39,21 @@ const char *argp_program_bug_address =
 const char argp_program_doc[] =
 "Count cache kernel function calls for a given set of PIDs.\n"
 "\n"
-"USAGE: cachestat [--help] [-T] [interval] [count] [--pids pid1,pid2,...]\n"
+"USAGE: cachestat [--help] [-T] [interval] [count] [--pids pid1,pid2,...] [--output file]\n"
 "\n"
 "EXAMPLES:\n"
 "    cachestat						# shows hits and misses to the file system page cache\n"
 "    cachestat -T					# include timestamps\n"
 "    cachestat 1 10					# print 1 second summaries, 10 times\n"
-"    cachestat --pids 123,456,789			# PIDs to consider for tracing";
+"    cachestat --pids 123,456,789			# PIDs to consider for tracing\n"
+"    cachestat --output stats.json			# write final global stats JSON on exit";
 
 static const struct argp_option opts[] = {
 	{ "timestamp", 'T', NULL, 0, "Print timestamp", 0 },
 	{ "verbose", 'v', NULL, 0, "Verbose debug output", 0 },
 	{ NULL, 'h', NULL, OPTION_HIDDEN, "Show the full help", 0 },
 	{ "pids", 'p', "PIDLIST", 0, "Comma-separated list of PIDs", 0 },
+	{ "output", 'o', "FILE", 0, "Write final global stats JSON to FILE", 0 },
 	{},
 };
 
@@ -67,6 +70,9 @@ static error_t parse_arg(int key, char *arg, struct argp_state *state)
 		break;
 	case 'T':
 		env.timestamp = true;
+		break;
+	case 'o':
+		env.output = arg;
 		break;
 	case ARGP_KEY_ARG:
 		errno = 0;
@@ -144,6 +150,46 @@ static int get_meminfo(__u64 *buffers, __u64 *cached)
 	return 0;
 }
 
+static int write_output_json(const char *output_path, __u64 hits, __u64 misses, __u64 dirties)
+{
+	FILE *f;
+	__u64 buffers, cached;
+	float hitratio;
+	__u64 total = hits + misses;
+	int err;
+
+	err = get_meminfo(&buffers, &cached);
+	if (err) {
+		fprintf(stderr, "failed to get meminfo for JSON output: %d\n", err);
+		return err;
+	}
+
+	hitratio = total > 0 ? (100.0f * hits) / total : 0.0f;
+	f = fopen(output_path, "w");
+	if (!f) {
+		err = errno;
+		fprintf(stderr, "failed to open output file '%s': %s\n", output_path, strerror(errno));
+		return err;
+	}
+
+	if (fprintf(f,
+		    "{\"hits\": %llu, \"misses\": %llu, \"dirties\": %llu, \"hitratio\": %.2f, \"buffers_mb\": %llu, \"cached_mb\": %llu}\n",
+		    hits, misses, dirties, hitratio, buffers / 1024, cached / 1024) < 0) {
+		err = errno;
+		fprintf(stderr, "failed to write output file '%s': %s\n", output_path, strerror(errno));
+		fclose(f);
+		return err;
+	}
+
+	if (fclose(f) != 0) {
+		err = errno;
+		fprintf(stderr, "failed to close output file '%s': %s\n", output_path, strerror(errno));
+		return err;
+	}
+
+	return 0;
+}
+
 int main(int argc, char **argv)
 {
 	static const struct argp argp = {
@@ -154,6 +200,9 @@ int main(int argc, char **argv)
 	__u64 buffers, cached, mbd;
 	struct cachestat_bpf *obj;
 	__s64 total, misses, hits;
+	__u64 total_hits = 0;
+	__u64 total_misses = 0;
+	__u64 total_dirties = 0;
 	float ratio;
 	char ts[32];
 	int err;
@@ -308,6 +357,11 @@ int main(int argc, char **argv)
 			misses = total;
 			hits = 0;
 		}
+
+		total_hits += (__u64)hits;
+		total_misses += (__u64)misses;
+		total_dirties += mbd;
+
 		ratio = total > 0 ? hits * 1.0 / total : 0.0;
 		err = get_meminfo(&buffers, &cached);
 		if (err) {
@@ -327,6 +381,9 @@ int main(int argc, char **argv)
 	}
 
 cleanup:
+	if (!err && env.output) {
+		err = write_output_json(env.output, total_hits, total_misses, total_dirties);
+	}
 	cachestat_bpf__destroy(obj);
 	return err != 0;
 }
