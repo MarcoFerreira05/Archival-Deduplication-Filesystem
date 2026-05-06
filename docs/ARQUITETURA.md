@@ -149,10 +149,9 @@ Passe 2 (flush):
      parte de plan[run_start].payload e cobre run_len * 4096 bytes
    - HITs no meio do plan são saltados, partindo o run
    - falha → rollback_allocations devolve todos os master_blk à free
-     list, liberta MasterInfos pendentes, decrementa refcount dos HITs
-     (nextBlockIndex NÃO é restaurado — os blocos alocados por append
-     são devolvidos à free list, e restaurar o índice criaria dupla
-     alocação)
+     list, liberta MasterInfos pendentes e decrementa refcount dos
+     HITs; não restaura nextBlockIndex, para evitar dupla alocação
+     quando índices de append já foram devolvidos à free list
 
 Passe 3 (consolidação, só após flush OK):
    - inserir MasterInfos pendentes em hash_to_master

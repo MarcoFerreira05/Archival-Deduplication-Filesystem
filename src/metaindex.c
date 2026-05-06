@@ -75,12 +75,16 @@ void *decode_block_indice(void *data, int size) {
   return b;
 }
 
-Bytes encode_free_block(void *elem) { return (Bytes){elem, sizeof(size_t)}; }
+Bytes encode_free_block(void *elem) {
+  return (Bytes){elem, sizeof(uint64_t)};
+}
 
 void *decode_free_block(void *data, int size) {
-  (void)size;
-  size_t *value = malloc(sizeof(size_t));
-  memcpy(value, data, sizeof(size_t));
+  if (size != sizeof(uint64_t))
+    return NULL;
+
+  uint64_t *value = malloc(sizeof(uint64_t));
+  memcpy(value, data, sizeof(uint64_t));
   return value;
 }
 
