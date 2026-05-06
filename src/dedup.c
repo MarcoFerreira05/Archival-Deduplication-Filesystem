@@ -1,29 +1,38 @@
 // =============================================================================
 // dedup.c — Camada de deduplicação a nível de bloco.
 //
-// `write_dedup` é a função central, e foi refactorizada para funcionar em
-// três passes:
+// `write_dedup` é a função central, refactorizada em três passes:
 //
 //   Passe 1 (decisão): para cada bloco lógico do request, calcula o hash e
 //                       decide se é HIT (já existe) ou MISS (novo). Para os
 //                       MISSes, cria um MasterInfo "pendente" sem o inserir
-//                       ainda no índice oficial. Aloca master_blk para todos
-//                       os MISSes em conjunto, no fim deste passe.
+//                       ainda no índice oficial.
+//
+//   Passe 1.5 (alocação): allocate_batch_storage_first atribui master_blk a
+//                       todos os MISSes — drena a free list LIFO antes de
+//                       fazer append (storage-first).
 //
 //   Passe 2 (flush):    agrupa MISSes com master_blk consecutivos em runs e
-//                       emite um único pwritev por run (pwrite quando run = 1).
-//                       Em caso de falha, faz rollback completo das alocações.
+//                       emite um único pwrite por run (pwrite individual
+//                       quando run = 1). Reusos da free list resultam em
+//                       runs de 1 (master_blk dispersos); appends agregam-se
+//                       num único run contíguo.
+//                       Em caso de falha, faz rollback completo.
 //
 //   Passe 3 (consolidação): só após o flush ter sucesso, insere os
 //                       MasterInfos pendentes em hash_to_master e os pares
 //                       (file, block) em file_to_master.
 //
 // Esta separação tem três objectivos:
-//   1. Reduzir N pwrite a 1 pwritev no caso comum (master_blk contíguos).
+//   1. Reduzir N pwrite a 1 pwrite no caso comum (master_blk contíguos).
 //   2. Garantir que se o flush falhar, o índice oficial não fica com entradas
 //      a apontar para blocos que nunca chegaram ao disco.
 //   3. Permitir que o allocator decida globalmente para o batch (e não bloco
 //      a bloco), o que é essencial para a política storage-first.
+//
+// `read_dedup` faz batching análogo no lado da leitura: ordena os blocos
+// pelo master_block_index, agrupa em runs físicos consecutivos e faz
+// 1 pread por run.
 // =============================================================================
 
 #include <stddef.h>
@@ -38,7 +47,6 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/stat.h>
-#include <sys/uio.h>   // pwritev / struct iovec
 #include <unistd.h>
 #ifdef __FreeBSD__
 #include <sys/socket.h>
@@ -50,7 +58,6 @@
 #endif
 
 #include "dedup.h"
-#include "freelist.h"
 #include "hashing.h"
 #include "metaindex.h"
 #include "passthrough_helpers.h"
@@ -95,6 +102,8 @@ int read_dedup(Index *index, const char *path, char *buf, size_t size,
 
   // Allocate single buffer for all reads not one per group
   char *master_buf = malloc(num_blocks * BLOCK_SIZE);
+  if (master_buf == NULL)
+    return -ENOMEM;
 
   // Phase 3 & 4: Identify groups and read them
   size_t group_start = 0;
@@ -154,19 +163,21 @@ void remove_block_dedup(Index *index, const char *path, uint64_t blockIndex) {
   remove_file_block(index, path, blockIndex);
   info->refcount--;
 
-  // Se mais ninguém referencia este bloco, devolve o slot à free list.
-  // O freelist_release faz coalescing com vizinhos adjacentes
-  // automaticamente (ver freelist.c).
+  // Se mais ninguém referencia este bloco, devolve o slot ao topo da
+  // free list (LIFO, O(1) em prepend).
   if (info->refcount == 0) {
-    freelist_release(&index->free_list, info->masterBlockIndex);
+    uint64_t *slot = malloc(sizeof(uint64_t));
+    *slot = info->masterBlockIndex;
+    index->free_block_list = g_slist_prepend(index->free_block_list, slot);
+
     remove_hash(index, info->hash);
     free(info);
   }
 }
 
 // =============================================================================
-// write_dedup — Reformulado em dois passes (Passe 1: decisão; Passe 2: flush;
-// Passe 3: consolidação).
+// write_dedup — três passes (Passe 1: decisão; Passe 1.5: alocação;
+// Passe 2: flush; Passe 3: consolidação).
 // =============================================================================
 
 // Estrutura efémera que representa cada bloco lógico do request durante
@@ -186,29 +197,33 @@ typedef struct {
 // Allocator storage-first
 // -----------------------------------------------------------------------------
 //
-// Filosofia: usar SEMPRE a free list antes de fazer append. Mesmo que os
-// extents sejam pequenos, são consumidos antes de o master crescer.
+// Filosofia: usar SEMPRE a free list antes de fazer append. Storage-first
+// — só fazemos crescer o master file quando a free list está vazia.
 //
-// Estratégia:
-//   - Se a free list tem >= miss_count slots livres, todos vêm de lá
-//     (best-fit por varrimento, possivelmente repartido por vários extents).
-//   - Caso contrário, drena tudo o que houver e completa com append.
+// Estratégia (LIFO O(1)):
+//   - Drena slots da head do GSList enquanto houver e ainda faltarem
+//     blocos no batch.
+//   - Resto vai por append (incremento de nextBlockIndex).
+//
+// Sem coalescing nem best-fit. Os slots saem na ordem LIFO em que foram
+// libertados, o que é suficiente: o caso comum no nosso workload é
+// append puro (free list vazia), e os reusos individuais não beneficiariam
+// de batching porque master_blk dispersos não cabem num único pwrite.
 static void allocate_batch_storage_first(Index *idx, uint64_t miss_count,
                                           uint64_t *next_block_index,
                                           uint64_t *out) {
-  uint64_t total = freelist_total_free(&idx->free_list);
-
-  if (total >= miss_count) {
-    // Caso ideal: a free list chega para tudo, o master não cresce.
-    freelist_take(&idx->free_list, miss_count, out);
-    return;
-  }
-
-  // Caso misto: drena a free list e completa com append.
   uint64_t taken = 0;
-  if (total > 0) {
-    taken = freelist_take(&idx->free_list, total, out);
+
+  // Drena a free list pela head (LIFO).
+  while (taken < miss_count && idx->free_block_list != NULL) {
+    GSList *head = idx->free_block_list;
+    uint64_t *slot = head->data;
+    out[taken++] = *slot;
+    idx->free_block_list = g_slist_delete_link(idx->free_block_list, head);
+    free(slot);
   }
+
+  // Remainder por append: o master cresce só agora, e só o necessário.
   for (uint64_t i = taken; i < miss_count; i++) {
     out[i] = (*next_block_index)++;
   }
@@ -220,11 +235,21 @@ static void allocate_batch_storage_first(Index *idx, uint64_t miss_count,
 //
 // Um "run" é uma sequência de PlanEntries MISS consecutivas no plan cujos
 // master_blk são também consecutivos. Quando isso acontece, podemos emitir
-// um único pwritev em vez de N pwrite — N syscalls a 1.
+// um único pwrite que cobre todos os blocos do run de uma vez — N syscalls
+// a 1.
 //
-// Runs de tamanho 1 degeneram para pwrite (igualmente eficiente).
-// HITs no meio do plan não impedem runs longos: simplesmente saltam-se,
-// porque os HITs não geram I/O.
+// Runs de tamanho 1 degeneram para 1 pwrite de 4 KiB.
+// HITs no meio do plan INTERROMPEM runs: se houver um HIT entre dois MISSes,
+// não é possível juntá-los num único pwrite porque os seus payloads não são
+// contíguos na memória (o buffer de input tem os dados do HIT no meio).
+// HITs só são "saltados" quando aparecem no início de uma janela não processada
+// (o while externo), nunca dentro de um run activo.
+//
+// Como funciona sem pwritev: dentro de um run os payloads são FISICAMENTE
+// contíguos no buffer de input do utilizador (a ordem do plan é a ordem
+// dos blocos lógicos no buf). Logo o run inteiro pode ser escrito com um
+// único pwrite que parte de plan[run_start].payload e cobre
+// run_len * BLOCK_SIZE.
 //
 // Retorna 0 em sucesso, -errno em falha. O caller é responsável pelo
 // rollback em caso de falha.
@@ -238,7 +263,10 @@ static int flush_plan(int masterFd, PlanEntry *plan, size_t n) {
     if (i == n) break;
 
     // Construir um run a partir do MISS actual, juntando MISSes seguintes
-    // cujo master_blk seja exactamente o anterior + 1.
+    // cujo master_blk seja exactamente o anterior + 1. Como o plan é
+    // percorrido pela ordem dos blocos lógicos, MISSes consecutivos no
+    // plan estão também em posições consecutivas no buffer de input —
+    // ou seja, o run é contíguo em memória e no master.
     size_t run_start = i;
     size_t run_len = 1;
     i++;
@@ -248,20 +276,13 @@ static int flush_plan(int masterFd, PlanEntry *plan, size_t n) {
       i++;
     }
 
-    // Construir o vector de iovecs (pode não ser preciso, mas mantém o
-    // código simétrico entre run=1 e run>1).
-    struct iovec iov[run_len];
-    for (size_t j = 0; j < run_len; j++) {
-      // pwritev/pwrite escrevem para offsets do ficheiro, não modificam
-      // o buffer de origem. O cast para void* é seguro.
-      iov[j].iov_base = (void *)plan[run_start + j].payload;
-      iov[j].iov_len = BLOCK_SIZE;
-    }
-
     off_t offset = (off_t)plan[run_start].master_blk * BLOCK_SIZE;
-    ssize_t written = pwritev(masterFd, iov, (int)run_len, offset);
+    size_t bytes = run_len * BLOCK_SIZE;
+    // Um único pwrite cobre o run inteiro. Para run_len==1 fica a
+    // semântica clássica de pwrite de um bloco isolado.
+    ssize_t written = pwrite(masterFd, plan[run_start].payload, bytes, offset);
 
-    if (written != (ssize_t)(run_len * BLOCK_SIZE)) {
+    if (written != (ssize_t)bytes) {
       // Falha total ou parcial: para simplificar, tratamos qualquer caso
       // como erro. O caller faz rollback.
       return (written < 0) ? -errno : -EIO;
@@ -282,10 +303,10 @@ static int flush_plan(int masterFd, PlanEntry *plan, size_t n) {
 //     a libertação fica a cargo do MISS original.
 //
 // Nota sobre nextBlockIndex: NÃO restauramos nextBlockIndex porque os blocos
-// alocados por append já foram adicionados à free list via freelist_release.
-// Restaurar nextBlockIndex criaria uma dupla alocação: o mesmo índice ficaria
-// tanto na free list como no ponto de append, podendo ser atribuído duas vezes
-// na próxima escrita.
+// alocados por append já foram adicionados à free list (via g_slist_prepend
+// na secção dos MISSes abaixo). Restaurar nextBlockIndex criaria uma dupla
+// alocação: o mesmo índice ficaria tanto na free list como no ponto de
+// append, podendo ser atribuído duas vezes na próxima escrita.
 static void rollback_allocations(Index *idx, PlanEntry *plan, size_t n) {
   // Reverter HITs: decrementa refcount; se for um MasterInfo já no índice
   // oficial e o refcount cair a 0, restaurá-lo seria muito invasivo, e não
@@ -299,14 +320,19 @@ static void rollback_allocations(Index *idx, PlanEntry *plan, size_t n) {
     }
   }
 
-  // Reverter MISSes: devolver master_blk à free list, libertar MasterInfo
-  // pendente. A free list aceita slots em qualquer ordem; o coalescing
-  // funde-os automaticamente se forem adjacentes.
-  // Tanto slots retirados da free list como slots alocados por append são
-  // devolvidos aqui — serão reutilizados nas próximas escritas.
+  // Reverter MISSes: devolver master_blk à free list (prepend O(1)),
+  // libertar MasterInfo pendente. Tanto slots retirados da free list como
+  // slots alocados por append são devolvidos aqui — serão reutilizados nas
+  // próximas escritas via pop da head do GSList (LIFO).
+  //
+  // É por isto que NÃO restauramos nextBlockIndex: os índices alocados por
+  // append já estão na free list, restaurar nextBlockIndex criaria uma
+  // dupla alocação (mesmo índice na free list E como próximo append).
   for (size_t i = 0; i < n; i++) {
     if (plan[i].kind == PLAN_MISS) {
-      freelist_release(&idx->free_list, plan[i].master_blk);
+      uint64_t *slot = malloc(sizeof(uint64_t));
+      *slot = plan[i].master_blk;
+      idx->free_block_list = g_slist_prepend(idx->free_block_list, slot);
       free(plan[i].info);
     }
   }
@@ -416,7 +442,7 @@ int write_dedup(Index *index, const char *path, const char *buf, size_t size,
   }
 
   // ---------------------------------------------------------------------------
-  // PASSE 2 — Flush. Emite pwritev/pwrite por runs contíguos.
+  // PASSE 2 — Flush. Emite pwrite por runs contíguos no master.
   // ---------------------------------------------------------------------------
   if (miss_count > 0) {
     int rc = flush_plan(masterFd, plan, num_blocks);

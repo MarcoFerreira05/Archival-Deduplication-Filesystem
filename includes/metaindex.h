@@ -1,7 +1,6 @@
 #ifndef METAINDEX_H
 #define METAINDEX_H
 
-#include "freelist.h"
 #include "persistence.h"
 #include <glib.h>
 #include <pthread.h>
@@ -30,10 +29,10 @@ typedef struct blockIndice {
 
 // Main index structure containing both indices and the free list.
 typedef struct index {
-  GHashTable *hash_to_master; // hash (unsigned char[64]) -> MasterInfo*
-  GHashTable *file_to_master; // BlockIndice* -> MasterInfo*
-  FreeList free_list;         // mapa de extents (slots livres reutilizáveis)
-  GHashTable *file_to_sizes;  // path (char*) -> size_t* (logical file size)
+  GHashTable *hash_to_master;  // hash (unsigned char[64]) -> MasterInfo*
+  GHashTable *file_to_master;  // BlockIndice* -> MasterInfo*
+  GSList *free_block_list;     // lista de uint64_t* (slots reutilizáveis, LIFO)
+  GHashTable *file_to_sizes;   // path (char*) -> size_t* (logical file size)
   pthread_mutex_t mutex;
 } Index;
 
@@ -45,6 +44,9 @@ void *decode_hash(void *data, int size);
 
 Bytes encode_block_indice(void *elem);
 void *decode_block_indice(void *data, int size);
+
+Bytes encode_free_block(void *elem);
+void *decode_free_block(void *data, int size);
 
 Bytes encode_size(void *elem);
 void *decode_size(void *data, int size);

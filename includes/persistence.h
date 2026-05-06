@@ -56,16 +56,13 @@ IndexedPairTables ghash_load_indexed_pair(
     IndexedTableLoadConfig config1, IndexedTableLoadConfig config2,
     DecodeFunc decode_value, GDestroyNotify free_value);
 
-// TODO: gslist_save/gslist_load eram usadas pela free list antiga (substituída
-// pelo módulo `freelist`). Não há outros utilizadores actuais; manter por
-// agora caso outros módulos persistam GSList no futuro. Se permanecerem sem
-// uso após algumas iterações, remover.
+// Persistência da free list: lista de slots livres como uint64_t individuais.
 void gslist_save(const char *path, GSList *list, EncodeFunc encode_elem);
 GSList *gslist_load(const char *path, DecodeFunc decode_elem);
 
 // Helpers de baixo-nível para escrever/ler elementos prefixados por tamanho
-// (size_t prefix + payload). Expostos para que módulos como `freelist`
-// possam reaproveitar o mesmo formato sem duplicar código.
+// (size_t prefix + payload). Expostos para que módulos com formatos próprios
+// possam reaproveitar o mesmo esquema sem duplicar código.
 void write_elem(int fd, Bytes b, off_t *offset);
 void *read_elem(int fd, DecodeFunc decode_func, off_t *offset);
 

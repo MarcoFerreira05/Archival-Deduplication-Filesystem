@@ -123,66 +123,95 @@ Três problemas concretos, mensuráveis no benchmark actual:
 
 ---
 
-## 4. Mudança Proposta
+## 4. Mudança Implementada
 
-Quatro mudanças coordenadas, descritas em detalhe em
+Três mudanças coordenadas. Detalhes históricos do design exploratório
+(incluindo a tentativa de extent map que foi descartada) ficam em
 [DESIGN_BATCHING_STORAGE_FIRST.md](../DESIGN_BATCHING_STORAGE_FIRST.md).
 
-### 4.1 `write_dedup` em dois passes
+### 4.1 `write_dedup` em três passes
 
 ```
 Passe 1 (decisão, sem I/O):
-   - hash + lookup para todos os blocos
-   - HITs incrementam refcount no plan local
-   - MISSes recebem MasterInfo "pendente" (não inserida em hash_to_master)
-   - alocação dos master_blk de TODOS os MISSes feita em conjunto
+   - hash + lookup para todos os blocos do request
+   - HITs incrementam refcount; MasterInfo partilhado (já no índice
+     oficial, ou pending neste mesmo batch)
+   - MISSes criam MasterInfo PENDENTE (NÃO inserido em hash_to_master)
+     e registam-no em pending_hashes para tratar intra-batch dedup
+
+Passe 1.5 (alocação batch):
+   - allocate_batch_storage_first decide os master_blk de TODOS os
+     MISSes em conjunto (drena free list, depois append)
 
 Passe 2 (flush):
-   - agrupa runs contíguos no plan
-   - emite UM pwritev por run (1 syscall ≥ 1 bloco)
-   - falha → rollback completo
+   - agrupa MISSes em runs contíguos no plan onde master_blk é
+     sequencial; cada run dispara um único pwrite (não pwritev) que
+     parte de plan[run_start].payload e cobre run_len * 4096 bytes
+   - HITs no meio do plan são saltados, partindo o run
+   - falha → rollback_allocations devolve todos os master_blk à free
+     list, liberta MasterInfos pendentes e decrementa refcount dos
+     HITs; não restaura nextBlockIndex, para evitar dupla alocação
+     quando índices de append já foram devolvidos à free list
 
 Passe 3 (consolidação, só após flush OK):
-   - inserir em hash_to_master e file_to_master
+   - inserir MasterInfos pendentes em hash_to_master
+   - inserir todos os pares (path, blk) em file_to_master
    - actualizar file_to_sizes
 ```
 
-### 4.2 Free list como mapa de extents
+A separação Passe 1 (decisão) / Passe 2 (flush) / Passe 3 (consolidação)
+garante que se o pwrite falhar, o índice oficial nunca fica com entradas
+a apontar para blocos que nunca chegaram ao disco.
 
-`GSList<uint64_t>` → `GTree<start → Extent>`, onde
-`Extent = { uint64_t start, uint64_t length }`.
+**Por que `pwrite` em vez de `pwritev`**: dentro de um run os payloads
+são fisicamente contíguos no buffer de input (a ordem do plan reflecte
+a ordem dos blocos lógicos), portanto um único `pwrite` cobre o run
+inteiro sem precisar de iovec. Quando há HITs intercalados que partem
+o run, paga-se a syscall extra — mas o profiling mostrou que esse
+custo é <1% do tempo total. A constraint da equipa (manter código
+observacional BPF calibrado para `pwrite`) selou a decisão.
 
-Permite lookup ordenado, walk eficiente para alocação batch e — sobretudo
-— **coalescing on release**.
+### 4.2 Free list como `GSList<uint64_t*>` LIFO
 
-### 4.3 Coalescing on release
+A free list é uma lista ligada simples. O release faz `g_slist_prepend`
+do slot (O(1)); o consumo faz pop da head (O(1)).
 
-Cada bloco libertado procura vizinhos adjacentes na árvore de extents e
-funde-se com eles:
+Esta forma é **deliberadamente simples**. Uma versão prévia usou um
+mapa de extents (`GTree<start → Extent>`) com coalescing automático
+nos 4 casos de vizinhança e best-fit por varrimento. Foi descartada
+após benchmarks revelarem:
 
-| Caso | Vizinhos | Acção |
-|---|---|---|
-| A | nenhum | criar `Extent(X, 1)` |
-| B | só predecessor (extent termina em `X-1`) | `pred->length++` |
-| C | só sucessor (extent começa em `X+1`) | `suc->start--; suc->length++` |
-| D | ambos | predecessor absorve `1 + suc.length`, sucessor é removido |
+- **Caminho quente do nosso workload é dominado por appends contíguos**
+  (free list quase sempre vazia ou pequena), portanto o ganho do
+  best-fit/coalescing era marginal a zero.
+- **Custo constante elevado**: alloc/free de `Extent*` por release,
+  varrimento da árvore por allocate, três operações sincronizadas no
+  caso D do coalescing. Estes custos pagam-se em **todas** as escritas
+  e remoções, mesmo nas que não beneficiam.
 
-Resultado: 100 unlinks consecutivos → **1 extent de tamanho 100**.
+A reintrodução do extent map fica como trabalho futuro **se** algum dia
+um workload mostrar fragmentação severa persistente da free list.
 
-### 4.4 Allocator storage-first
+### 4.3 Allocator storage-first (LIFO O(1))
 
 ```
-allocate_batch_storage_first(K):
-   total = freelist_total_free()
-   se total >= K:
-      freelist_take(K)               ← reuso máximo, master não cresce
-   senão:
-      freelist_take(total)
-      append remainder via nextBlockIndex
+allocate_batch_storage_first(miss_count):
+   taken = 0
+   enquanto taken < miss_count e free_block_list != NULL:
+      slot = pop head (O(1))
+      out[taken++] = slot
+   para i em taken..miss_count-1:
+      out[i] = (*nextBlockIndex)++
 ```
 
-Sem `THRESHOLD`, sem fallback automático para append. Master só cresce
-quando a free list está completamente esgotada.
+Sem `THRESHOLD`, sem fallback automático para append. **Master só cresce
+quando a free list está completamente esgotada** — propriedade
+storage-first preservada.
+
+Perdeu-se "best-fit" e "coalescing" face à versão com extent map. Para
+o nosso flush actual isso é irrelevante: como cada slot reusado vira um
+run de tamanho 1 (master_blk dispersos), não havia batching possível
+para reusos mesmo com coalescing.
 
 ---
 
@@ -199,17 +228,23 @@ quando há slots livres seria filosoficamente contraditório.
 
 ### 5.2 Trade-off explícito
 
-Sob fragmentação severa (free list com muitos extents pequenos), a alocação
-storage-first produz `master_blk` dispersos, e o flush acaba por emitir
-mais que um syscall. **Aceitamos este custo** em troca de não desperdiçar
-espaço.
+Sob fragmentação da free list, a alocação storage-first produz
+`master_blk` dispersos, e o flush acaba por emitir mais que um syscall
+(um `pwrite` por slot reusado, não há batching de runs descontíguos).
+**Aceitamos este custo** em troca de não desperdiçar espaço.
 
-Uma alternativa — política `syscall-first` com fallback para append quando
-extents são pequenos demais — foi prototipada e descartada após medições
-empíricas: nos workloads testados, as duas políticas convergem no caminho
-quente (free list vazia ou com 1 extent grande coalescido) e o syscall
-count fica indistinguível. A configurabilidade entre políticas pode voltar
-a ser explorada se um workload futuro mostrar divergência mensurável.
+Duas alternativas foram prototipadas e descartadas após medições empíricas:
+
+- Política `syscall-first` (fallback para append puro quando os extents
+  são pequenos) — convergiu com `storage-first` no caminho quente e o
+  syscall count ficou indistinguível.
+- Free list como mapa de extents com coalescing — adicionava overhead
+  constante (mallocs/frees, varrimento) por release sem ganho mensurável,
+  porque o caminho quente é dominado por appends contíguos onde a
+  estrutura simples chega.
+
+Ambas podem voltar a ser exploradas se um workload futuro mostrar
+divergência mensurável.
 
 ### 5.3 Por que NÃO `io_uring`
 
@@ -231,29 +266,34 @@ a ser explorada se um workload futuro mostrar divergência mensurável.
 ## 6. Roadmap
 
 ### Já feito neste PR
-- Refactor de `write_dedup` em dois passes com `pwritev`.
-- Mapa de extents (`FreeList`) com coalescing on release.
-- Allocator storage-first como única política activa.
-- Persistência migrável (auto-coalesce do formato antigo).
+- Refactor de `write_dedup` em três passes (decisão → flush → consolidação).
+- Flush via `pwrite` agregando runs contíguos no buffer de input.
+- Free list `GSList<uint64_t*>` LIFO simples.
+- Allocator storage-first (drena free list antes de append).
+- `pending_hashes` para intra-batch dedup.
+- `rollback_allocations` em caso de falha de I/O.
 - Teste de round-trip (`tests/roundtrip.sh`).
 
 ### Trabalho futuro (intencionalmente adiado)
 
-- **Fase 3 — Índice secundário `by_length`** para best-fit em O(log F) em
-  vez de varrimento O(F). Adiado porque o coalescing mantém o número de
-  extents pequeno (dezenas em estado estável); a complexidade de manter
-  dois índices sincronizados não compensa enquanto não houver profiling
-  que mostre o varrimento como hotspot. Documentação inline em
-  [includes/freelist.h](../includes/freelist.h) e
-  [src/freelist.c](../src/freelist.c) com prós/contras detalhados.
+- **Free list como mapa de extents + coalescing**. Foi prototipada e
+  descartada porque o overhead constante não se justificava no nosso
+  workload. Reintroduzir só se medições mostrarem fragmentação severa
+  persistente ou se o batching de reusos passar a ser viável (ex.: com
+  `pwritev` ou `io_uring`).
+
+- **`pwritev` em vez de `pwrite`** para juntar runs descontíguos num só
+  syscall. Custo actual estimado é <1% do wall-clock. Reabrir se o
+  colega do BPF aceitar adaptar o código observacional para incluir
+  `pwritev` na contagem.
 
 - **Encolher `nextBlockIndex` no release** quando o slot libertado toca
-  a fronteira do master. Micro-optimização; deixada como TODO.
+  a fronteira do master. Micro-optimização TODO.
 
 - **Reintroduzir política syscall-first configurável** se um workload
-  futuro mostrar divergência mensurável face à storage-first. O ponto de
-  variação está concentrado em `allocate_batch_storage_first` —
-  facilmente substituível por um switch.
+  futuro mostrar divergência mensurável. O ponto de variação está
+  concentrado em `allocate_batch_storage_first` — fácil de substituir
+  por switch.
 
 ---
 
@@ -284,7 +324,7 @@ sudo umount /mnt/fs
 | Métrica | Como medir |
 |---|---|
 | Tamanho `/masterFILE` | `stat -c %s /masterFILE` |
-| Syscalls `pwrite`/`pwritev` | `bpf_programs/syscounter` durante benchmark |
+| Syscalls `pwrite` | `bpf_programs/syscounter` durante benchmark |
 | Tamanho da freelist | inspecção de `/table_path_free_block_list` |
 
 ---
@@ -298,13 +338,11 @@ sudo umount /mnt/fs
 - **Hash hit / miss** — quando o hash de um bloco lógico já existe (HIT) ou
   não (MISS) no índice `hash_to_master`.
 - **Slot** — posição livre/ocupada no master file (offset = `slot * 4096`).
-- **Free list** — estrutura que regista slots livres para reuso.
-- **Extent** — par `(start, length)` representando `length` slots
-  contíguos livres a partir de `start`.
+- **Free list** — `GSList<uint64_t*>` LIFO que regista slots livres para
+  reuso.
 - **Run** — sequência de blocos com `master_blk` consecutivos no plan,
-  agrupada num único `pwritev` durante o flush.
+  agrupada num único `pwrite` durante o flush.
 - **Batch** — conjunto de blocos lógicos de um único request FUSE.
-- **Coalesce** — fundir extents adjacentes num só.
 - **Storage-first** — política de alocação que prioriza não crescer o
   master, drenando sempre a free list antes de fazer append. É a
   política activa na biblioteca.
