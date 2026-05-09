@@ -603,7 +603,17 @@ int write_dedup(Index *index, const char *path, const char *buf, size_t size,
   }
 
   // Insere os mapeamentos (file, block) → MasterInfo para todos.
+  // Se este write faz overwrite do mesmo bloco lógico, remove primeiro
+  // o mapping anterior para decrementar o refcount do MasterInfo antigo
+  // e libertar o slot físico quando o contador chegar a zero.
   for (size_t i = 0; i < num_blocks; i++) {
+    MasterInfo *existing =
+        lookup_file_block(index, path, plan[i].logical_blk);
+
+    if (existing != NULL && existing != plan[i].info) {
+      remove_block_dedup(index, path, plan[i].logical_blk);
+    }
+
     insert_file_block(index, path, plan[i].logical_blk, plan[i].info);
   }
 
