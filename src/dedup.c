@@ -82,16 +82,26 @@ int read_dedup(Index *index, const char *path, char *buf, size_t size,
   if (num_blocks == 0)
     return 0;
 
-  // Phase 1: Lookup all blocks and create pairs
+  // Phase 1: Lookup all blocks and create pairs.
+  // Read lock no metadata_rwlock — múltiplos read_dedup correm em
+  // paralelo. Copiamos master_block_index para o array local; NÃO
+  // guardamos o ponteiro MasterInfo* (pode ser libertado por
+  // remove_block_dedup assim que libertarmos o read lock).
   BlockPair pairs[num_blocks];
+  pthread_rwlock_rdlock(&index->metadata_rwlock);
   for (size_t i = 0; i < num_blocks; i++) {
     MasterInfo *info = lookup_by_file_block(index, path, start_block + i);
     if (info == NULL) {
+      pthread_rwlock_unlock(&index->metadata_rwlock);
       return -1;
     }
     pairs[i].logical_idx = i;
     pairs[i].master_block_index = info->masterBlockIndex;
   }
+  pthread_rwlock_unlock(&index->metadata_rwlock);
+
+  // Phases 2-5 correm SEM LOCK. Os pairs[] são locais, e os preads
+  // a offsets disjuntos no master file são thread-safe por POSIX.
 
   // Phase 2: Sort pairs by master block index
   if (num_blocks <= INSERTION_SORT_THRESHOLD) {
@@ -225,7 +235,9 @@ static void allocate_batch_storage_first(Index *idx, uint64_t miss_count,
                                           uint64_t *out) {
   uint64_t taken = 0;
 
-  // Drena a free list pela head (LIFO).
+  // Drena a free list pela head (LIFO). Lock isolado à parte que toca
+  // o GSList — tirado mal acaba a drenagem.
+  pthread_mutex_lock(&idx->freelist_mutex);
   while (taken < miss_count && idx->free_block_list != NULL) {
     GSList *head = idx->free_block_list;
     uint64_t *slot = head->data;
@@ -233,12 +245,13 @@ static void allocate_batch_storage_first(Index *idx, uint64_t miss_count,
     idx->free_block_list = g_slist_delete_link(idx->free_block_list, head);
     free(slot);
   }
+  pthread_mutex_unlock(&idx->freelist_mutex);
 
   // Remainder por append: o master cresce só agora, e só o necessário.
-  // Reserva atómica de range contíguo — permite múltiplas threads
-  // appendarem em paralelo sem lock, em ranges disjuntos por construção.
-  // RELAXED memory order: é counter puro; o pwrite que se segue passa
-  // por syscall do kernel, que tem as suas próprias barreiras.
+  // Reserva atómica de range contíguo — múltiplas threads appendam em
+  // paralelo SEM lock, em ranges disjuntos por construção.
+  // RELAXED memory order: counter puro; o pwrite que se segue passa
+  // por syscall do kernel, com as suas próprias barreiras.
   uint64_t remaining = miss_count - taken;
   if (remaining > 0) {
     uint64_t base = __atomic_fetch_add(next_block_index, remaining,
@@ -350,6 +363,9 @@ static void rollback_allocations(Index *idx, PlanEntry *plan, size_t n) {
   // É por isto que NÃO restauramos nextBlockIndex: os índices alocados por
   // append já estão na free list, restaurar nextBlockIndex criaria uma
   // dupla alocação (mesmo índice na free list E como próximo append).
+  //
+  // freelist_mutex pegue 1 vez para todos os prepends (em vez de N vezes).
+  pthread_mutex_lock(&idx->freelist_mutex);
   for (size_t i = 0; i < n; i++) {
     if (plan[i].kind == PLAN_MISS) {
       uint64_t *slot = malloc(sizeof(uint64_t));
@@ -358,6 +374,7 @@ static void rollback_allocations(Index *idx, PlanEntry *plan, size_t n) {
       free(plan[i].info);
     }
   }
+  pthread_mutex_unlock(&idx->freelist_mutex);
 }
 
 // -----------------------------------------------------------------------------
@@ -397,16 +414,17 @@ int write_dedup(Index *index, const char *path, const char *buf, size_t size,
       g_hash_table_new(hash512_hash, hash512_equal);
 
   // ---------------------------------------------------------------------------
-  // PASSE 1 — Decisão. Sem I/O, sem inserção definitiva.
+  // PASSE 1 — Decisão. Hash + lookup. Read lock no metadata_rwlock
+  // permite múltiplos write_dedup correrem o Passe 1 em paralelo (e em
+  // paralelo com read_dedup).
   // ---------------------------------------------------------------------------
   size_t miss_count = 0;
+  pthread_rwlock_rdlock(&index->metadata_rwlock);
   for (size_t i = 0; i < num_blocks; i++) {
     plan[i].logical_blk = start_block + i;
     plan[i].payload = buf + i * BLOCK_SIZE;
 
-    // Calcular hash do bloco directamente a partir do buffer do utilizador
-    // (evita uma cópia para um array intermediário, ao contrário do código
-    // original).
+    // Calcular hash directamente a partir do buf do utilizador.
     hash((const unsigned char *)plan[i].payload, plan[i].hash);
 
     // Procurar primeiro no índice oficial; depois nos pendentes deste batch.
@@ -416,44 +434,43 @@ int write_dedup(Index *index, const char *path, const char *buf, size_t size,
     }
 
     if (existing != NULL) {
-      // HIT: o conteúdo já existe (ou no índice ou neste mesmo batch).
-      // Aumenta o refcount; o MasterInfo é partilhado.
-      // Atomic com RELAXED: o lock que segura o caller (read lock) já
-      // garante visibilidade do MasterInfo; o increment é counter puro.
+      // HIT: incrementa refcount atomicamente. RELAXED chega — o read
+      // lock garante visibilidade do MasterInfo.
       plan[i].kind = PLAN_HIT;
       plan[i].info = existing;
       __atomic_fetch_add(&existing->refcount, 1, __ATOMIC_RELAXED);
     } else {
-      // MISS: novo conteúdo. Cria-se o MasterInfo mas NÃO se insere em
-      // hash_to_master ainda — só após o flush bem-sucedido (Passe 3).
+      // MISS: cria MasterInfo pendente. Ainda não publicado em
+      // hash_to_master — só no Passe 3 após o pwrite ter sucesso.
       MasterInfo *info = g_new(MasterInfo, 1);
       memcpy(info->hash, plan[i].hash, HASH_SIZE);
-      // Init não-atómico OK: este info ainda não foi publicado em
-      // hash_to_master, ninguém mais o vê.
       atomic_store_explicit(&info->refcount, 1, memory_order_relaxed);
-      info->masterBlockIndex = 0;  // preenchido na fase de alocação abaixo
+      info->masterBlockIndex = 0;
 
       plan[i].kind = PLAN_MISS;
       plan[i].info = info;
 
-      // Regista no batch para que o próximo bloco com o mesmo hash vire HIT.
       g_hash_table_insert(pending_hashes, info->hash, info);
       miss_count++;
     }
   }
+  pthread_rwlock_unlock(&index->metadata_rwlock);
 
   // ---------------------------------------------------------------------------
-  // PASSE 1.5 — Alocação dos master_blk para todos os MISSes em conjunto.
+  // PASSE 1.5 — Alocação. Pega freelist_mutex breve + atomic fetch_add.
   // ---------------------------------------------------------------------------
   if (miss_count > 0) {
     uint64_t master_blks_stack[256];
     uint64_t *master_blks =
         miss_count <= 256 ? master_blks_stack : g_new(uint64_t, miss_count);
 
+    // allocate_batch_storage_first faz locking interno: pega
+    // freelist_mutex breve durante a drenagem, depois usa
+    // __atomic_fetch_add no nextBlockIndex sem qualquer lock.
     allocate_batch_storage_first(index, miss_count, nextBlockIndex,
                                   master_blks);
 
-    // Preenche master_blk em cada PlanEntry MISS, na ordem em que apareceram.
+    // Preenche master_blk em cada PlanEntry MISS.
     size_t m = 0;
     for (size_t i = 0; i < num_blocks; i++) {
       if (plan[i].kind == PLAN_MISS) {
@@ -468,13 +485,14 @@ int write_dedup(Index *index, const char *path, const char *buf, size_t size,
   }
 
   // ---------------------------------------------------------------------------
-  // PASSE 2 — Flush. Emite pwrite por runs contíguos no master.
+  // PASSE 2 — Flush. SEM LOCK. Múltiplas threads emitem pwrite em paralelo
+  // a offsets disjuntos no master file (POSIX garante atomicidade ao nível
+  // do fd). Esta é a peça grande do paralelismo.
   // ---------------------------------------------------------------------------
   if (miss_count > 0) {
     int rc = flush_plan(masterFd, plan, num_blocks);
     if (rc < 0) {
-      // Erro de I/O: rollback completo. Free list, MasterInfos pendentes e
-      // refcounts dos HITs são revertidos.
+      // Erro de I/O: rollback completo (pega locks internamente).
       rollback_allocations(index, plan, num_blocks);
       g_hash_table_destroy(pending_hashes);
       if (plan_heap)
@@ -484,14 +502,42 @@ int write_dedup(Index *index, const char *path, const char *buf, size_t size,
   }
 
   // ---------------------------------------------------------------------------
-  // PASSE 3 — Consolidação. Só corre depois do flush ter passado.
-  // Inserir os MasterInfos pendentes no hash_to_master, e os pares
-  // (file, block) no file_to_master.
+  // PASSE 3 — Consolidação. Write lock no metadata_rwlock. Inclui
+  // double-check insert: relookup ao hash antes de inserir, para fechar
+  // a race com outras threads que possam ter inserido o mesmo conteúdo
+  // entretanto. Custo: pwrite ocasional desperdiçado, sem corrupção
+  // nem duplicados em hash_to_master.
   // ---------------------------------------------------------------------------
+  GSList *slots_to_release = NULL;
+
+  pthread_rwlock_wrlock(&index->metadata_rwlock);
+
   for (size_t i = 0; i < num_blocks; i++) {
-    if (plan[i].kind == PLAN_MISS) {
+    if (plan[i].kind != PLAN_MISS)
+      continue;
+
+    // Double-check: outro thread pode ter inserido o mesmo hash entre
+    // o nosso Passe 1 e este Passe 3.
+    MasterInfo *winner = lookup_by_hash(index, plan[i].info->hash);
+    if (winner != NULL) {
+      // Outra thread venceu a race. O nosso pwrite no slot
+      // plan[i].master_blk fica desperdiçado — devolve à free list.
+      uint64_t *slot = malloc(sizeof(uint64_t));
+      *slot = plan[i].master_blk;
+      slots_to_release = g_slist_prepend(slots_to_release, slot);
+
+      // Liberta o nosso MasterInfo pendente; usa o vencedor.
+      g_free(plan[i].info);
+      plan[i].info = winner;
+      __atomic_fetch_add(&winner->refcount, 1, __ATOMIC_RELAXED);
+    } else {
+      // Nós ganhamos: inserimos o nosso MasterInfo no índice oficial.
       insert_hash(index, plan[i].info->hash, plan[i].info);
     }
+  }
+
+  // Insere os mapeamentos (file, block) → MasterInfo para todos.
+  for (size_t i = 0; i < num_blocks; i++) {
     insert_file_block(index, path, plan[i].logical_blk, plan[i].info);
   }
 
@@ -504,6 +550,16 @@ int write_dedup(Index *index, const char *path, const char *buf, size_t size,
     g_hash_table_insert(index->file_to_sizes, g_strdup(path), logical_size);
   } else if (new_end > *logical_size) {
     *logical_size = new_end;
+  }
+
+  pthread_rwlock_unlock(&index->metadata_rwlock);
+
+  // Devolve à free list os slots descartados pelo double-check (raro).
+  if (slots_to_release != NULL) {
+    pthread_mutex_lock(&index->freelist_mutex);
+    index->free_block_list =
+        g_slist_concat(slots_to_release, index->free_block_list);
+    pthread_mutex_unlock(&index->freelist_mutex);
   }
 
   g_hash_table_destroy(pending_hashes);

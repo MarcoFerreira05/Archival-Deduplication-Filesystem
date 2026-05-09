@@ -493,14 +493,11 @@ static int xmp_read(const char *path, char *buf, size_t size, off_t offset,
   if (fd == -1)
     return -errno;
 
-  // read from the master file through the dedup layer.
-  // Read lock — múltiplos leitores podem coexistir; só compete com
-  // writers (write_dedup, unlink, truncate).
-  // Commit 3 vai mover a fase de pread para fora do lock.
-  pthread_rwlock_rdlock(&p_ctx->index->metadata_rwlock);
+  // read_dedup faz locking interno: read lock só durante a fase de
+  // lookups; o pread propriamente dito corre sem qualquer lock,
+  // permitindo múltiplos preads em paralelo a offsets disjuntos.
   int total_read =
       read_dedup(p_ctx->index, path, buf, size, offset, p_ctx->masterFd);
-  pthread_rwlock_unlock(&p_ctx->index->metadata_rwlock);
 
   if (fi == NULL)
     close(fd);
@@ -539,14 +536,12 @@ static int xmp_write(const char *path, const char *buf, size_t size,
   if (fd == -1)
     return -errno;
 
-  // write through the dedup layer.
-  // Por enquanto pega-se write lock à volta de tudo; Commit 3 vai
-  // dividir o lock em fases (Passe 1 read, Passe 2 sem lock, Passe 3
-  // write) para extrair paralelismo real.
-  pthread_rwlock_wrlock(&p_ctx->index->metadata_rwlock);
+  // write_dedup faz locking interno: read lock no Passe 1 (hash +
+  // lookup), nada no Passe 2 (pwrite), write lock no Passe 3
+  // (consolidação com double-check insert). Múltiplos pwrites correm
+  // em paralelo a offsets disjuntos.
   res = write_dedup(p_ctx->index, path, buf, size, offset, p_ctx->masterFd,
                     &p_ctx->nextBlockIndex);
-  pthread_rwlock_unlock(&p_ctx->index->metadata_rwlock);
 
   if (fi == NULL)
     close(fd);
