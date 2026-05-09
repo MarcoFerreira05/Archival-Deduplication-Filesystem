@@ -447,9 +447,15 @@ int write_dedup(Index *index, const char *path, const char *buf, size_t size,
   if (size == 0)
     return 0;
 
+  // Esta lib só suporta writes alinhados a BLOCK_SIZE (e múltiplos dele).
+  // Se o caller pedir um write sub-bloco (size < BLOCK_SIZE) ou que não
+  // termine na fronteira de um bloco, retornamos -EOPNOTSUPP para
+  // sinalizar erro EXPLICITAMENTE. Antes retornávamos 0, o que provocava
+  // **livelock** no kernel (POSIX read/write retornar 0 com size > 0
+  // significa "tenta de novo", e o kernel re-emitia o pedido eternamente).
   size_t num_blocks = size / BLOCK_SIZE;
-  if (num_blocks == 0)
-    return 0;
+  if (num_blocks == 0 || size % BLOCK_SIZE != 0)
+    return -EOPNOTSUPP;
 
   uint64_t start_block = offset / BLOCK_SIZE;
 

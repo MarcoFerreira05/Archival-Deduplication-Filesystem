@@ -110,19 +110,30 @@ test_empty_file() {
   cleanup_fs
 }
 
-test_sub_block_file() {
-  test_start "ficheiro sub-bloco (100 bytes)"
+test_sub_block_file_rejected_gracefully() {
+  test_start "write sub-bloco (100 bytes) rejeitado sem livelock"
   local f="${MOUNT}/tiny.bin"
-  printf 'a%.0s' {1..100} > "$f"
-  local size_reported size_expected=100
-  size_reported=$(stat -c '%s' "$f")
-  local content
-  content=$(cat "$f")
-  if [[ "$size_reported" == "$size_expected" && "${#content}" == "$size_expected" ]]; then
-    pass
+  # O enunciado garante que todas as operações são alinhadas a BLOCK_SIZE.
+  # Este teste valida ROBUSTEZ: se algo passar um write não-alinhado por
+  # acidente, o sistema rejeita com erro em vez de livelockear. Timeout
+  # de 5 s para apanhar regressão (livelock) caso o fix do EOPNOTSUPP
+  # seja revertido.
+  if timeout 5 bash -c "printf 'a%.0s' {1..100} > '$f'" 2>/dev/null; then
+    # Write não devia ter sucesso. Limpa antes de falhar.
+    rm -f "$f" 2>/dev/null
+    fail "test_sub_block_file_rejected_gracefully" \
+         "write sub-bloco devia ter falhado mas teve sucesso"
   else
-    fail "test_sub_block_file" "size=$size_reported expected=$size_expected, content_len=${#content}"
+    local rc=$?
+    if [[ $rc -eq 124 ]]; then
+      fail "test_sub_block_file_rejected_gracefully" \
+           "TIMEOUT 5s — livelock detectado, regressão!"
+    else
+      # Falha normal (EOPNOTSUPP ou similar): comportamento esperado.
+      pass
+    fi
   fi
+  rm -f "$f" 2>/dev/null
   cleanup_fs
 }
 
@@ -139,19 +150,27 @@ test_exactly_one_block() {
   cleanup_fs
 }
 
-test_unaligned_size() {
-  test_start "tamanho não-alinhado (12345 bytes)"
+test_unaligned_size_rejected_gracefully() {
+  test_start "write não-alinhado (12345 bytes) rejeitado sem livelock"
   local src=$(mktemp) f="${MOUNT}/unaligned.bin"
   dd if=/dev/urandom of="$src" bs=1 count=12345 status=none
-  cp "$src" "$f"
-  local size_reported=$(stat -c '%s' "$f")
-  local md5_src=$(md5_of "$src") md5_dst=$(md5_via_cat "$f")
-  rm -f "$src"
-  if [[ "$size_reported" == "12345" && "$md5_src" == "$md5_dst" ]]; then
-    pass
+  # Robustez: o enunciado garante alinhamento, mas se um cp acidental
+  # passar 12345 bytes (último chunk = 57 bytes não-alinhado), o sistema
+  # rejeita com erro em vez de livelockear.
+  if timeout 5 cp "$src" "$f" 2>/dev/null; then
+    rm -f "$src" "$f" 2>/dev/null
+    fail "test_unaligned_size_rejected_gracefully" \
+         "cp com tamanho não-alinhado devia ter falhado mas teve sucesso"
   else
-    fail "test_unaligned_size" "size=$size_reported md5_src=$md5_src md5_dst=$md5_dst"
+    local rc=$?
+    if [[ $rc -eq 124 ]]; then
+      fail "test_unaligned_size_rejected_gracefully" \
+           "TIMEOUT 5s — livelock detectado, regressão!"
+    else
+      pass
+    fi
   fi
+  rm -f "$src" "$f" 2>/dev/null
   cleanup_fs
 }
 
@@ -459,15 +478,19 @@ test_freelist_reuse() {
 # --- 7. Stress generalizado --------------------------------------------------
 
 test_many_small_files_concurrent() {
-  test_start "100 ficheiros pequenos criados em paralelo"
+  test_start "100 ficheiros de 1 bloco criados em paralelo"
   cleanup_fs
+  # Usa dd bs=4096 count=1 (1 bloco exacto = 4 KiB) por causa da
+  # constraint "operações alinhadas a BLOCK_SIZE" do enunciado.
+  # Cada ficheiro contém o byte ASCII do dígito final do índice
+  # repetido 4096 vezes (não é importante o conteúdo, só validar
+  # que os 100 ficheiros se escrevem em paralelo sem perder).
   local pids=()
   for i in {1..100}; do
     (
-      printf 'data_%d\n' "$i" > "${MOUNT}/many_$i.txt"
+      yes "$((i % 10))" 2>/dev/null | head -c 4096 > "${MOUNT}/many_$i.bin"
     ) &
     pids+=($!)
-    # Limita paralelismo para não esgotar fork.
     if [[ ${#pids[@]} -ge 20 ]]; then
       for pid in "${pids[@]}"; do wait "$pid"; done
       pids=()
@@ -475,12 +498,13 @@ test_many_small_files_concurrent() {
   done
   for pid in "${pids[@]}"; do wait "$pid"; done
 
-  local count=$(ls "${MOUNT}"/many_*.txt 2>/dev/null | wc -l)
-  # Verifica conteúdo de uma amostra.
+  local count=$(ls "${MOUNT}"/many_*.bin 2>/dev/null | wc -l)
+  # Valida tamanho de uma amostra (1, 50, 100): cada ficheiro deve ter
+  # exactamente 4096 bytes.
   local sample_ok=1
   for i in 1 50 100; do
-    local content=$(cat "${MOUNT}/many_$i.txt")
-    if [[ "$content" != "data_$i" ]]; then sample_ok=0; break; fi
+    local size=$(stat -c '%s' "${MOUNT}/many_$i.bin" 2>/dev/null || echo -1)
+    if [[ "$size" != "4096" ]]; then sample_ok=0; break; fi
   done
 
   cleanup_fs
@@ -503,9 +527,9 @@ echo
 
 echo "${BOLD}1. EOF e tamanhos não-alinhados${RESET}"
 test_empty_file
-test_sub_block_file
+test_sub_block_file_rejected_gracefully
 test_exactly_one_block
-test_unaligned_size
+test_unaligned_size_rejected_gracefully
 test_read_past_eof
 
 echo

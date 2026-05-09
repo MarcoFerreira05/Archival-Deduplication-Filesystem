@@ -38,6 +38,15 @@ Componentes principais:
 
 Bloco físico: **4 KiB**. Hash: **SHA-512** (64 B).
 
+### Constraint do enunciado
+
+O trabalho prático garante que **todas as operações de leitura e escrita
+são alinhadas a `BLOCK_SIZE`** (offset e size múltiplos de 4 KiB). A
+biblioteca opera com base nesta assunção: writes não-alinhados são
+rejeitados com `-EOPNOTSUPP` (em vez de provocarem livelock no kernel,
+que era o comportamento pré-existente quando `write_dedup` retornava 0
+sem ter feito nada).
+
 ---
 
 ## 2. Estado Actual (pré-refactor)
