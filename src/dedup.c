@@ -224,8 +224,17 @@ static void allocate_batch_storage_first(Index *idx, uint64_t miss_count,
   }
 
   // Remainder por append: o master cresce só agora, e só o necessário.
-  for (uint64_t i = taken; i < miss_count; i++) {
-    out[i] = (*next_block_index)++;
+  // Reserva atómica de range contíguo — permite múltiplas threads
+  // appendarem em paralelo sem lock, em ranges disjuntos por construção.
+  // RELAXED memory order: é counter puro; o pwrite que se segue passa
+  // por syscall do kernel, que tem as suas próprias barreiras.
+  uint64_t remaining = miss_count - taken;
+  if (remaining > 0) {
+    uint64_t base = __atomic_fetch_add(next_block_index, remaining,
+                                        __ATOMIC_RELAXED);
+    for (uint64_t i = 0; i < remaining; i++) {
+      out[taken + i] = base + i;
+    }
   }
 }
 

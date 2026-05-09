@@ -169,9 +169,24 @@ static int xmp_getattr(const char *path, struct stat *stbuf,
 #endif
 
   res = lstat(path, stbuf);
+
+  // Lookup ao tamanho lógico do ficheiro tem de ser feito com lock —
+  // outro thread pode estar a actualizar (write_dedup) ou a remover
+  // (xmp_unlink). Copiamos o valor para a stack antes de libertar o
+  // lock, porque o ponteiro retornado pode ser invalidado por um remove
+  // posterior.
+  pthread_mutex_lock(&p_ctx->index->mutex);
   size_t *size_pointer = g_hash_table_lookup(p_ctx->index->file_to_sizes, path);
+  size_t logical_size = 0;
+  int has_size = 0;
   if (size_pointer != NULL) {
-    stbuf->st_size = *size_pointer;
+    logical_size = *size_pointer;
+    has_size = 1;
+  }
+  pthread_mutex_unlock(&p_ctx->index->mutex);
+
+  if (has_size) {
+    stbuf->st_size = logical_size;
   }
 
   if (res == -1)
