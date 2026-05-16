@@ -10,10 +10,14 @@ Description:
   The chosen mode uses its own file set.
   Results are written to a PID-specific directory.
   Note: --runtime only affects reads mode; writes are size-based.
+  BASE_DIR is not a CLI flag. To change target mount/path, edit BASE_DIR
+  directly inside this script.
 
 Flags:
   --jobs=N          Number of worker files. Default: 4
-  --dedup=PERCENT   Write dedupe percentage for fio. Default: 0
+  --dedup=PERCENT   Write dedupe percentage per job (NOT split by jobs).
+                    Example: --jobs=4 --dedup=50 => each job runs at 50%
+                    dedupe_percentage. Default: 0
   --runtime=SECONDS Runtime in seconds for read fio jobs. Ignored for writes.
                     Default: 60
   --size=SIZE       Total size to split across jobs.
@@ -96,16 +100,19 @@ PY
 }
 
 SIZE_BYTES="$(size_to_bytes "$SIZE")"
+if ! [[ "$JOBS" =~ ^[0-9]+$ ]] || [[ "$JOBS" -le 0 ]]; then
+    echo "Invalid --jobs value: $JOBS (expected integer > 0)" >&2
+    exit 1
+fi
 JOB_SIZE_BYTES=$((SIZE_BYTES / JOBS))
 if [[ "$JOB_SIZE_BYTES" -le 0 ]]; then
     echo "Invalid per-job size computed from SIZE=$SIZE and JOBS=$JOBS" >&2
     exit 1
 fi
 
-JOB_DEDUP=$((DEDUP / JOBS))
-if [[ "$DEDUP" -gt 0 && "$JOB_DEDUP" -lt 1 ]]; then
-    echo "Warning: DEDUP=$DEDUP divided by JOBS=$JOBS results in 0%; setting each job to 1%" >&2
-    JOB_DEDUP=1
+if ! [[ "$DEDUP" =~ ^[0-9]+$ ]] || [[ "$DEDUP" -lt 0 || "$DEDUP" -gt 100 ]]; then
+    echo "Invalid --dedup value: $DEDUP (expected integer 0..100)" >&2
+    exit 1
 fi
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -128,7 +135,7 @@ if [[ "$MODE" == "writes" ]]; then
             --output="${RESULTS_DIR}/write_${i}.json" \
             --output-format=json \
             --size="$JOB_SIZE_BYTES" \
-            --dedupe_percentage="$JOB_DEDUP" \
+            --dedupe_percentage="$DEDUP" \
             --randseed="$SEED" &
     done
 else
@@ -146,6 +153,6 @@ fi
 
 wait
 
-echo "fio run complete (MODE=$MODE, JOBS=$JOBS, DEDUP=$DEDUP (JOB_DEDUP=$JOB_DEDUP), RUNTIME=${RUNTIME}s, SIZE=$SIZE, JOB_SIZE_BYTES=$JOB_SIZE_BYTES, RESULTS_DIR=$RESULTS_DIR)"
+echo "fio run complete (MODE=$MODE, JOBS=$JOBS, DEDUP_PER_JOB=$DEDUP, RUNTIME=${RUNTIME}s, SIZE=$SIZE, JOB_SIZE_BYTES=$JOB_SIZE_BYTES, RESULTS_DIR=$RESULTS_DIR)"
 python3 "$ANALYZE_PY" "$MODE" "$RESULTS_DIR"
 sudo sh -c 'sync; echo 3 > /proc/sys/vm/drop_caches'
