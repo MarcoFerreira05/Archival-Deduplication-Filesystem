@@ -1,6 +1,7 @@
 #ifndef DEDUP_H
 #define DEDUP_H
 
+#include <stdatomic.h>
 #include <stdint.h>
 #include <sys/types.h>
 
@@ -35,8 +36,19 @@ int read_dedup(Index *index, const char *path, char *buf, size_t size,
                off_t offset, int masterFd);
 
 int write_dedup(Index *index, const char *path, const char *buf, size_t size,
-                off_t offset, int masterFd, uint64_t *nextBlockIndex);
+                off_t offset, int masterFd,
+                _Atomic uint64_t *nextBlockIndex);
 
 void remove_block_dedup(Index *index, const char *path, uint64_t blockIndex);
+
+// Remove em lote as referências ao path para os blocos lógicos no
+// intervalo [start_block, end_block). Faz locking interno: 1 acquire
+// do metadata_rwlock (write) + 1 acquire do freelist_mutex (em vez de
+// 2N como o loop ingenuo de remove_block_dedup).
+//
+// Usado por xmp_unlink (start=0, end=num_blocks) e xmp_truncate
+// (start=new_block_count, end=old_block_count).
+void remove_blocks_dedup_batch(Index *index, const char *path,
+                                uint64_t start_block, uint64_t end_block);
 
 #endif

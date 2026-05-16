@@ -82,33 +82,52 @@ int read_dedup(Index *index, const char *path, char *buf, size_t size,
   if (num_blocks == 0)
     return 0;
 
-  // Phase 1: Lookup all blocks and create pairs
+  // Phase 1: Lookup all blocks and create pairs.
+  // Read lock no metadata_rwlock — múltiplos read_dedup correm em
+  // paralelo. Copiamos master_block_index para o array local; NÃO
+  // guardamos o ponteiro MasterInfo* (pode ser libertado por
+  // remove_block_dedup assim que libertarmos o read lock).
+  //
+  // Se um lookup falhar, é EOF (caller pediu além do tamanho do
+  // ficheiro). Param-se os lookups e devolvem-se só os blocos que
+  // tinham mapeamento. POSIX: read past EOF retorna < size, eventualmente 0.
   BlockPair pairs[num_blocks];
+  size_t valid_blocks = 0;
+  pthread_rwlock_rdlock(&index->metadata_rwlock);
   for (size_t i = 0; i < num_blocks; i++) {
     MasterInfo *info = lookup_by_file_block(index, path, start_block + i);
     if (info == NULL) {
-      return -1;
+      // EOF — não há mais blocos lógicos. Devolvemos só os já lidos.
+      break;
     }
-    pairs[i].logical_idx = i;
-    pairs[i].master_block_index = info->masterBlockIndex;
+    pairs[valid_blocks].logical_idx = i;
+    pairs[valid_blocks].master_block_index = info->masterBlockIndex;
+    valid_blocks++;
   }
+  pthread_rwlock_unlock(&index->metadata_rwlock);
+
+  if (valid_blocks == 0)
+    return 0;  // EOF imediato.
+
+  // Phases 2-5 correm SEM LOCK. Os pairs[] são locais, e os preads
+  // a offsets disjuntos no master file são thread-safe por POSIX.
 
   // Phase 2: Sort pairs by master block index
-  if (num_blocks <= INSERTION_SORT_THRESHOLD) {
-    insertion_sort(pairs, num_blocks);
+  if (valid_blocks <= INSERTION_SORT_THRESHOLD) {
+    insertion_sort(pairs, valid_blocks);
   } else {
-    qsort(pairs, num_blocks, sizeof(BlockPair), cmp_master_idx);
+    qsort(pairs, valid_blocks, sizeof(BlockPair), cmp_master_idx);
   }
 
   // Allocate single buffer for all reads not one per group
-  char *master_buf = malloc(num_blocks * BLOCK_SIZE);
+  char *master_buf = malloc(valid_blocks * BLOCK_SIZE);
   if (master_buf == NULL)
     return -ENOMEM;
 
   // Phase 3 & 4: Identify groups and read them
   size_t group_start = 0;
-  for (size_t i = 1; i <= num_blocks; i++) {
-    int is_last = (i == num_blocks);
+  for (size_t i = 1; i <= valid_blocks; i++) {
+    int is_last = (i == valid_blocks);
 
     int is_consec = !is_last && (pairs[i].master_block_index ==
                                  pairs[i - 1].master_block_index + 1);
@@ -126,7 +145,7 @@ int read_dedup(Index *index, const char *path, char *buf, size_t size,
       ssize_t res = pread(masterFd, dst, BLOCK_SIZE, min_master * BLOCK_SIZE);
       if (res != BLOCK_SIZE) {
         free(master_buf);
-        return -1;
+        return -EIO;
       }
     } else {
       size_t read_size = blocks_in_group * BLOCK_SIZE;
@@ -134,7 +153,7 @@ int read_dedup(Index *index, const char *path, char *buf, size_t size,
           pread(masterFd, master_buf, read_size, min_master * BLOCK_SIZE);
       if (res != (ssize_t)read_size) {
         free(master_buf);
-        return -1;
+        return -EIO;
       }
       // Phase 5: Copy each block to correct position in output
       for (size_t j = group_start; j < i; j++) {
@@ -148,30 +167,92 @@ int read_dedup(Index *index, const char *path, char *buf, size_t size,
     group_start = i;
   }
   free(master_buf);
-  return size;
+  // Devolve bytes lidos (pode ser < size se o caller pediu além do EOF).
+  return (int)(valid_blocks * BLOCK_SIZE);
 }
 
 // -----------------------------------------------------------------------------
 // Remove single-block reference. Usado por xmp_unlink/xmp_truncate em loop.
 // -----------------------------------------------------------------------------
 
+// PRECONDITION: caller deve segurar metadata_rwlock em write mode.
+// O cleanup do MasterInfo (quando refcount cai a 0) tem de acontecer
+// sob write lock para excluir leitores que ainda possam ter o ponteiro.
 void remove_block_dedup(Index *index, const char *path, uint64_t blockIndex) {
   MasterInfo *info = lookup_by_file_block(index, path, blockIndex);
   if (info == NULL)
     return;
 
   remove_file_block(index, path, blockIndex);
-  info->refcount--;
 
-  // Se mais ninguém referencia este bloco, devolve o slot ao topo da
-  // free list (LIFO, O(1) em prepend).
-  if (info->refcount == 0) {
+  // fetch_sub atómico para coordenar com increments paralelos sob read
+  // lock. ACQ_REL: RELEASE garante que escritas anteriores ao info
+  // ficam visíveis se for cleanup; ACQUIRE garante que vemos estado
+  // estabilizado se ganharmos a corrida ao 0.
+  // Se fetch_sub retornar 1, o valor antes do dec era 1, agora é 0 —
+  // somos o último a soltar a referência.
+  if (__atomic_fetch_sub(&info->refcount, 1, __ATOMIC_ACQ_REL) == 1) {
+    // Devolve o slot à free list. Pega freelist_mutex isoladamente
+    // (já temos metadata_rwlock em wr; ordem hierárquica respeitada:
+    // metadata > freelist).
     uint64_t *slot = malloc(sizeof(uint64_t));
     *slot = info->masterBlockIndex;
+    pthread_mutex_lock(&index->freelist_mutex);
     index->free_block_list = g_slist_prepend(index->free_block_list, slot);
+    pthread_mutex_unlock(&index->freelist_mutex);
 
     remove_hash(index, info->hash);
     free(info);
+  }
+}
+
+// -----------------------------------------------------------------------------
+// remove_blocks_dedup_batch — versão batch para xmp_unlink/xmp_truncate.
+// -----------------------------------------------------------------------------
+//
+// Adquire metadata_rwlock em write mode 1 vez, faz lookup+remove para
+// todos os blocos no intervalo [start_block, end_block), recolhe os
+// slots que cairam a refcount=0 num GSList local, liberta o
+// metadata_rwlock e finalmente prepende o GSList local à free list
+// global num único acquire do freelist_mutex.
+//
+// Custo: 2 acquires de locks no total, em vez de 2N do loop ingénuo
+// (1 acquire de metadata_rwlock + 1 acquire de freelist_mutex por
+// bloco). Mais eficiente para ficheiros grandes.
+void remove_blocks_dedup_batch(Index *index, const char *path,
+                                uint64_t start_block, uint64_t end_block) {
+  if (start_block >= end_block)
+    return;
+
+  // GSList local com os slots a libertar — construído sob metadata_rwlock,
+  // depois concat'd à free list global.
+  GSList *to_release = NULL;
+
+  pthread_rwlock_wrlock(&index->metadata_rwlock);
+  for (uint64_t i = start_block; i < end_block; i++) {
+    MasterInfo *info = lookup_by_file_block(index, path, i);
+    if (info == NULL)
+      continue;
+
+    remove_file_block(index, path, i);
+
+    // Decrement atómico — coordenado com Passe 1 do write_dedup que
+    // pode estar a fazer increments noutros threads.
+    if (__atomic_fetch_sub(&info->refcount, 1, __ATOMIC_ACQ_REL) == 1) {
+      uint64_t *slot = malloc(sizeof(uint64_t));
+      *slot = info->masterBlockIndex;
+      to_release = g_slist_prepend(to_release, slot);
+      remove_hash(index, info->hash);
+      free(info);
+    }
+  }
+  pthread_rwlock_unlock(&index->metadata_rwlock);
+
+  // Concat à free list global num único acquire (em vez de N prepends).
+  if (to_release != NULL) {
+    pthread_mutex_lock(&index->freelist_mutex);
+    index->free_block_list = g_slist_concat(to_release, index->free_block_list);
+    pthread_mutex_unlock(&index->freelist_mutex);
   }
 }
 
@@ -210,11 +291,13 @@ typedef struct {
 // append puro (free list vazia), e os reusos individuais não beneficiariam
 // de batching porque master_blk dispersos não cabem num único pwrite.
 static void allocate_batch_storage_first(Index *idx, uint64_t miss_count,
-                                          uint64_t *next_block_index,
+                                          _Atomic uint64_t *next_block_index,
                                           uint64_t *out) {
   uint64_t taken = 0;
 
-  // Drena a free list pela head (LIFO).
+  // Drena a free list pela head (LIFO). Lock isolado à parte que toca
+  // o GSList — tirado mal acaba a drenagem.
+  pthread_mutex_lock(&idx->freelist_mutex);
   while (taken < miss_count && idx->free_block_list != NULL) {
     GSList *head = idx->free_block_list;
     uint64_t *slot = head->data;
@@ -222,10 +305,20 @@ static void allocate_batch_storage_first(Index *idx, uint64_t miss_count,
     idx->free_block_list = g_slist_delete_link(idx->free_block_list, head);
     free(slot);
   }
+  pthread_mutex_unlock(&idx->freelist_mutex);
 
   // Remainder por append: o master cresce só agora, e só o necessário.
-  for (uint64_t i = taken; i < miss_count; i++) {
-    out[i] = (*next_block_index)++;
+  // Reserva atómica de range contíguo — múltiplas threads appendam em
+  // paralelo SEM lock, em ranges disjuntos por construção.
+  // RELAXED memory order: counter puro; o pwrite que se segue passa
+  // por syscall do kernel, com as suas próprias barreiras.
+  uint64_t remaining = miss_count - taken;
+  if (remaining > 0) {
+    uint64_t base = __atomic_fetch_add(next_block_index, remaining,
+                                        __ATOMIC_RELAXED);
+    for (uint64_t i = 0; i < remaining; i++) {
+      out[taken + i] = base + i;
+    }
   }
 }
 
@@ -308,16 +401,35 @@ static int flush_plan(int masterFd, PlanEntry *plan, size_t n) {
 // alocação: o mesmo índice ficaria tanto na free list como no ponto de
 // append, podendo ser atribuído duas vezes na próxima escrita.
 static void rollback_allocations(Index *idx, PlanEntry *plan, size_t n) {
-  // Reverter HITs: decrementa refcount; se for um MasterInfo já no índice
-  // oficial e o refcount cair a 0, restaurá-lo seria muito invasivo, e não
-  // acontece neste cenário de erro local (o MasterInfo só estava no índice
-  // antes deste batch porque ALGUÉM ainda o referenciava).
-  // Para MasterInfos pendentes (intra-batch), a libertação acontece abaixo,
-  // no caminho dos MISSes.
+  // Reverter HITs: decrementa refcount atomicamente. Se o decrement
+  // levar refcount a 0 (caso patológico: outro thread fez unlink/truncate
+  // que removeu a última referência "real" entre o nosso Passe 1 e este
+  // rollback), temos de fazer cleanup completo, senão o MasterInfo fica
+  // preso em hash_to_master e o slot nunca volta à free list.
+  //
+  // Cleanup precisa de write lock no metadata_rwlock + freelist_mutex
+  // (lock hierarchy: metadata > freelist).
+  GSList *hit_slots_to_release = NULL;
+  pthread_rwlock_wrlock(&idx->metadata_rwlock);
   for (size_t i = 0; i < n; i++) {
-    if (plan[i].kind == PLAN_HIT) {
-      plan[i].info->refcount--;
+    if (plan[i].kind != PLAN_HIT)
+      continue;
+    if (__atomic_fetch_sub(&plan[i].info->refcount, 1, __ATOMIC_ACQ_REL) == 1) {
+      // Caímos a 0. Cleanup do MasterInfo.
+      uint64_t *slot = malloc(sizeof(uint64_t));
+      *slot = plan[i].info->masterBlockIndex;
+      hit_slots_to_release = g_slist_prepend(hit_slots_to_release, slot);
+      remove_hash(idx, plan[i].info->hash);
+      g_free(plan[i].info);
     }
+  }
+  pthread_rwlock_unlock(&idx->metadata_rwlock);
+
+  if (hit_slots_to_release != NULL) {
+    pthread_mutex_lock(&idx->freelist_mutex);
+    idx->free_block_list =
+        g_slist_concat(hit_slots_to_release, idx->free_block_list);
+    pthread_mutex_unlock(&idx->freelist_mutex);
   }
 
   // Reverter MISSes: devolver master_blk à free list (prepend O(1)),
@@ -328,6 +440,9 @@ static void rollback_allocations(Index *idx, PlanEntry *plan, size_t n) {
   // É por isto que NÃO restauramos nextBlockIndex: os índices alocados por
   // append já estão na free list, restaurar nextBlockIndex criaria uma
   // dupla alocação (mesmo índice na free list E como próximo append).
+  //
+  // freelist_mutex pegue 1 vez para todos os prepends (em vez de N vezes).
+  pthread_mutex_lock(&idx->freelist_mutex);
   for (size_t i = 0; i < n; i++) {
     if (plan[i].kind == PLAN_MISS) {
       uint64_t *slot = malloc(sizeof(uint64_t));
@@ -336,6 +451,7 @@ static void rollback_allocations(Index *idx, PlanEntry *plan, size_t n) {
       free(plan[i].info);
     }
   }
+  pthread_mutex_unlock(&idx->freelist_mutex);
 }
 
 // -----------------------------------------------------------------------------
@@ -343,14 +459,21 @@ static void rollback_allocations(Index *idx, PlanEntry *plan, size_t n) {
 // -----------------------------------------------------------------------------
 
 int write_dedup(Index *index, const char *path, const char *buf, size_t size,
-                off_t offset, int masterFd, uint64_t *nextBlockIndex) {
+                off_t offset, int masterFd,
+                _Atomic uint64_t *nextBlockIndex) {
   // Caso degenerado: write de 0 bytes não faz nada.
   if (size == 0)
     return 0;
 
+  // Esta lib só suporta writes alinhados a BLOCK_SIZE (e múltiplos dele).
+  // Se o caller pedir um write sub-bloco (size < BLOCK_SIZE) ou que não
+  // termine na fronteira de um bloco, retornamos -EOPNOTSUPP para
+  // sinalizar erro EXPLICITAMENTE. Antes retornávamos 0, o que provocava
+  // **livelock** no kernel (POSIX read/write retornar 0 com size > 0
+  // significa "tenta de novo", e o kernel re-emitia o pedido eternamente).
   size_t num_blocks = size / BLOCK_SIZE;
-  if (num_blocks == 0)
-    return 0;
+  if (num_blocks == 0 || size % BLOCK_SIZE != 0)
+    return -EOPNOTSUPP;
 
   uint64_t start_block = offset / BLOCK_SIZE;
 
@@ -375,16 +498,17 @@ int write_dedup(Index *index, const char *path, const char *buf, size_t size,
       g_hash_table_new(hash512_hash, hash512_equal);
 
   // ---------------------------------------------------------------------------
-  // PASSE 1 — Decisão. Sem I/O, sem inserção definitiva.
+  // PASSE 1 — Decisão. Hash + lookup. Read lock no metadata_rwlock
+  // permite múltiplos write_dedup correrem o Passe 1 em paralelo (e em
+  // paralelo com read_dedup).
   // ---------------------------------------------------------------------------
   size_t miss_count = 0;
+  pthread_rwlock_rdlock(&index->metadata_rwlock);
   for (size_t i = 0; i < num_blocks; i++) {
     plan[i].logical_blk = start_block + i;
     plan[i].payload = buf + i * BLOCK_SIZE;
 
-    // Calcular hash do bloco directamente a partir do buffer do utilizador
-    // (evita uma cópia para um array intermediário, ao contrário do código
-    // original).
+    // Calcular hash directamente a partir do buf do utilizador.
     hash((const unsigned char *)plan[i].payload, plan[i].hash);
 
     // Procurar primeiro no índice oficial; depois nos pendentes deste batch.
@@ -394,40 +518,43 @@ int write_dedup(Index *index, const char *path, const char *buf, size_t size,
     }
 
     if (existing != NULL) {
-      // HIT: o conteúdo já existe (ou no índice ou neste mesmo batch).
-      // Aumenta o refcount; o MasterInfo é partilhado.
+      // HIT: incrementa refcount atomicamente. RELAXED chega — o read
+      // lock garante visibilidade do MasterInfo.
       plan[i].kind = PLAN_HIT;
       plan[i].info = existing;
-      existing->refcount++;
+      __atomic_fetch_add(&existing->refcount, 1, __ATOMIC_RELAXED);
     } else {
-      // MISS: novo conteúdo. Cria-se o MasterInfo mas NÃO se insere em
-      // hash_to_master ainda — só após o flush bem-sucedido (Passe 3).
+      // MISS: cria MasterInfo pendente. Ainda não publicado em
+      // hash_to_master — só no Passe 3 após o pwrite ter sucesso.
       MasterInfo *info = g_new(MasterInfo, 1);
       memcpy(info->hash, plan[i].hash, HASH_SIZE);
-      info->refcount = 1;
-      info->masterBlockIndex = 0;  // preenchido na fase de alocação abaixo
+      atomic_store_explicit(&info->refcount, 1, memory_order_relaxed);
+      info->masterBlockIndex = 0;
 
       plan[i].kind = PLAN_MISS;
       plan[i].info = info;
 
-      // Regista no batch para que o próximo bloco com o mesmo hash vire HIT.
       g_hash_table_insert(pending_hashes, info->hash, info);
       miss_count++;
     }
   }
+  pthread_rwlock_unlock(&index->metadata_rwlock);
 
   // ---------------------------------------------------------------------------
-  // PASSE 1.5 — Alocação dos master_blk para todos os MISSes em conjunto.
+  // PASSE 1.5 — Alocação. Pega freelist_mutex breve + atomic fetch_add.
   // ---------------------------------------------------------------------------
   if (miss_count > 0) {
     uint64_t master_blks_stack[256];
     uint64_t *master_blks =
         miss_count <= 256 ? master_blks_stack : g_new(uint64_t, miss_count);
 
+    // allocate_batch_storage_first faz locking interno: pega
+    // freelist_mutex breve durante a drenagem, depois usa
+    // __atomic_fetch_add no nextBlockIndex sem qualquer lock.
     allocate_batch_storage_first(index, miss_count, nextBlockIndex,
                                   master_blks);
 
-    // Preenche master_blk em cada PlanEntry MISS, na ordem em que apareceram.
+    // Preenche master_blk em cada PlanEntry MISS.
     size_t m = 0;
     for (size_t i = 0; i < num_blocks; i++) {
       if (plan[i].kind == PLAN_MISS) {
@@ -442,13 +569,14 @@ int write_dedup(Index *index, const char *path, const char *buf, size_t size,
   }
 
   // ---------------------------------------------------------------------------
-  // PASSE 2 — Flush. Emite pwrite por runs contíguos no master.
+  // PASSE 2 — Flush. SEM LOCK. Múltiplas threads emitem pwrite em paralelo
+  // a offsets disjuntos no master file (POSIX garante atomicidade ao nível
+  // do fd). Esta é a peça grande do paralelismo.
   // ---------------------------------------------------------------------------
   if (miss_count > 0) {
     int rc = flush_plan(masterFd, plan, num_blocks);
     if (rc < 0) {
-      // Erro de I/O: rollback completo. Free list, MasterInfos pendentes e
-      // refcounts dos HITs são revertidos.
+      // Erro de I/O: rollback completo (pega locks internamente).
       rollback_allocations(index, plan, num_blocks);
       g_hash_table_destroy(pending_hashes);
       if (plan_heap)
@@ -458,13 +586,73 @@ int write_dedup(Index *index, const char *path, const char *buf, size_t size,
   }
 
   // ---------------------------------------------------------------------------
-  // PASSE 3 — Consolidação. Só corre depois do flush ter passado.
-  // Inserir os MasterInfos pendentes no hash_to_master, e os pares
-  // (file, block) no file_to_master.
+  // PASSE 3 — Consolidação. Write lock no metadata_rwlock. Inclui
+  // double-check insert: relookup ao hash antes de inserir, para fechar
+  // a race com outras threads que possam ter inserido o mesmo conteúdo
+  // entretanto. Custo: pwrite ocasional desperdiçado, sem corrupção
+  // nem duplicados em hash_to_master.
   // ---------------------------------------------------------------------------
+  GSList *slots_to_release = NULL;
+
+  pthread_rwlock_wrlock(&index->metadata_rwlock);
+
   for (size_t i = 0; i < num_blocks; i++) {
-    if (plan[i].kind == PLAN_MISS) {
+    if (plan[i].kind != PLAN_MISS)
+      continue;
+
+    // Double-check: outro thread pode ter inserido o mesmo hash entre
+    // o nosso Passe 1 e este Passe 3.
+    MasterInfo *winner = lookup_by_hash(index, plan[i].info->hash);
+    if (winner != NULL) {
+      // Outra thread venceu a race. O nosso pwrite no slot
+      // plan[i].master_blk fica desperdiçado — devolve à free list.
+      uint64_t *slot = malloc(sizeof(uint64_t));
+      *slot = plan[i].master_blk;
+      slots_to_release = g_slist_prepend(slots_to_release, slot);
+
+      // Liberta o nosso MasterInfo pendente; usa o vencedor.
+      g_free(plan[i].info);
+      plan[i].info = winner;
+      __atomic_fetch_add(&winner->refcount, 1, __ATOMIC_RELAXED);
+    } else {
+      // Nós ganhamos: inserimos o nosso MasterInfo no índice oficial.
       insert_hash(index, plan[i].info->hash, plan[i].info);
+    }
+  }
+
+  // Insere os mapeamentos (file, block) → MasterInfo para todos.
+  //
+  // Tratamento de OVERWRITE: se já existe uma entrada (path, logical_blk)
+  // a apontar para um MasterInfo antigo, temos de decrementar o refcount
+  // desse MasterInfo. Sem isto, o info fica órfão em hash_to_master
+  // (refcount nunca chega a 0) e o slot no master nunca volta à free
+  // list — leak permanente que se acumula com cada overwrite.
+  //
+  // Caso especial: se old == plan[i].info (overwrite com mesmo conteúdo
+  // ou mesmo MasterInfo via dedup), o increment do Passe 1 e o decrement
+  // aqui cancelam-se. O refcount permanece correcto porque a entrada no
+  // file_to_master substitui-se sem novo titular.
+  //
+  // (Nota: o Copilot Autofix em f6e5cd0 sugeriu chamar remove_block_dedup
+  // mas usou nome errado — `lookup_file_block` em vez de
+  // `lookup_by_file_block`, que não existe; aliás chamar
+  // remove_block_dedup faz um lookup duplo desnecessário. Esta versão
+  // faz lookup uma vez e decrementa inline.)
+  for (size_t i = 0; i < num_blocks; i++) {
+    MasterInfo *old =
+        lookup_by_file_block(index, path, plan[i].logical_blk);
+    if (old != NULL) {
+      // Decrement atómico do antigo. ACQ_REL: vê estado consistente do
+      // MasterInfo se ganharmos a corrida ao 0.
+      if (__atomic_fetch_sub(&old->refcount, 1, __ATOMIC_ACQ_REL) == 1) {
+        // Último titular — cleanup completo. Slot vai à free list (o
+        // concat é feito num único acquire no fim do Passe 3).
+        uint64_t *slot = malloc(sizeof(uint64_t));
+        *slot = old->masterBlockIndex;
+        slots_to_release = g_slist_prepend(slots_to_release, slot);
+        remove_hash(index, old->hash);
+        g_free(old);
+      }
     }
     insert_file_block(index, path, plan[i].logical_blk, plan[i].info);
   }
@@ -478,6 +666,16 @@ int write_dedup(Index *index, const char *path, const char *buf, size_t size,
     g_hash_table_insert(index->file_to_sizes, g_strdup(path), logical_size);
   } else if (new_end > *logical_size) {
     *logical_size = new_end;
+  }
+
+  pthread_rwlock_unlock(&index->metadata_rwlock);
+
+  // Devolve à free list os slots descartados pelo double-check (raro).
+  if (slots_to_release != NULL) {
+    pthread_mutex_lock(&index->freelist_mutex);
+    index->free_block_list =
+        g_slist_concat(slots_to_release, index->free_block_list);
+    pthread_mutex_unlock(&index->freelist_mutex);
   }
 
   g_hash_table_destroy(pending_hashes);

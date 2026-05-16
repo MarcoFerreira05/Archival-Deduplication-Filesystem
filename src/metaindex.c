@@ -172,13 +172,18 @@ Index *index_init(void) {
   index->free_block_list =
       gslist_load(TABLE_PATH_FREE_BLOCK_LIST, decode_free_block);
 
-  pthread_mutex_init(&index->mutex, NULL);
+  pthread_rwlock_init(&index->metadata_rwlock, NULL);
+  pthread_mutex_init(&index->freelist_mutex, NULL);
 
   return index;
 }
 
 void index_destroy(Index *index) {
-  pthread_mutex_lock(&index->mutex);
+  // Persistência sob locks (defesa, embora xmp_destroy só seja chamado
+  // após o FUSE parar de despachar requests). Ordem: metadata primeiro,
+  // freelist depois (lock hierarchy).
+  pthread_rwlock_wrlock(&index->metadata_rwlock);
+  pthread_mutex_lock(&index->freelist_mutex);
 
   // encode_hash doesn't allocate, so free_encoded_key=FALSE
   IndexedTableSaveConfig config1 = {encode_hash, FALSE};
@@ -194,7 +199,8 @@ void index_destroy(Index *index) {
   gslist_save(TABLE_PATH_FREE_BLOCK_LIST, index->free_block_list,
               encode_free_block);
 
-  pthread_mutex_unlock(&index->mutex);
+  pthread_mutex_unlock(&index->freelist_mutex);
+  pthread_rwlock_unlock(&index->metadata_rwlock);
 
   // Free all MasterInfo objects (one per unique block, stored in
   // hash_to_master)
@@ -211,7 +217,8 @@ void index_destroy(Index *index) {
   g_hash_table_destroy(index->file_to_sizes);
   g_slist_free_full(index->free_block_list, free);
 
-  pthread_mutex_destroy(&index->mutex);
+  pthread_rwlock_destroy(&index->metadata_rwlock);
+  pthread_mutex_destroy(&index->freelist_mutex);
   free(index);
 }
 

@@ -34,6 +34,7 @@
 #endif
 #include "dedup.h"
 #include <dirent.h>
+#include <stdatomic.h>
 #include <errno.h>
 #include <fcntl.h>
 #include <fuse.h>
@@ -63,7 +64,10 @@ typedef struct context {
   FILE *fp;
   Index *index;
   int masterFd;
-  uint64_t nextBlockIndex;
+  // Atomic — múltiplas threads de write reservam ranges contíguos via
+  // __atomic_fetch_add (allocate_batch_storage_first em src/dedup.c).
+  // Inicializado em xmp_init (single-threaded antes do FUSE despachar).
+  _Atomic uint64_t nextBlockIndex;
 #ifdef DEBUG
   uint64_t create;
   uint64_t open;
@@ -104,7 +108,9 @@ static void *xmp_init(struct fuse_conn_info *conn, struct fuse_config *cfg) {
   ctx->masterFd = open("/masterFILE", O_RDWR | O_CREAT, 0666);
   struct stat stbuf;
   lstat("/masterFILE", &stbuf);
-  ctx->nextBlockIndex = stbuf.st_size / BLOCK_SIZE;
+  // atomic_init: stores iniciais a um _Atomic. xmp_init é single-thread
+  // (FUSE só começa a despachar requests depois desta função retornar).
+  atomic_init(&ctx->nextBlockIndex, stbuf.st_size / BLOCK_SIZE);
 
 #ifdef DEBUG
   ctx->open = 0;
@@ -169,9 +175,24 @@ static int xmp_getattr(const char *path, struct stat *stbuf,
 #endif
 
   res = lstat(path, stbuf);
+
+  // Lookup ao tamanho lógico do ficheiro tem de ser feito com lock —
+  // outro thread pode estar a actualizar (write_dedup) ou a remover
+  // (xmp_unlink). Copiamos o valor para a stack antes de libertar o
+  // lock, porque o ponteiro retornado pode ser invalidado por um remove
+  // posterior.
+  pthread_rwlock_rdlock(&p_ctx->index->metadata_rwlock);
   size_t *size_pointer = g_hash_table_lookup(p_ctx->index->file_to_sizes, path);
+  size_t logical_size = 0;
+  int has_size = 0;
   if (size_pointer != NULL) {
-    stbuf->st_size = *size_pointer;
+    logical_size = *size_pointer;
+    has_size = 1;
+  }
+  pthread_rwlock_unlock(&p_ctx->index->metadata_rwlock);
+
+  if (has_size) {
+    stbuf->st_size = logical_size;
   }
 
   if (res == -1)
@@ -253,18 +274,28 @@ static int xmp_unlink(const char *path) {
   //         gettid(), path, f_ctx->uid, f_ctx->pid);
 #endif
 
-  pthread_mutex_lock(&p_ctx->index->mutex);
+  // Lê o tamanho lógico sob read lock para descobrir quantos blocos
+  // libertar. Liberta o lock antes de chamar remove_blocks_dedup_batch
+  // (que pega write lock internamente).
+  pthread_rwlock_rdlock(&p_ctx->index->metadata_rwlock);
   size_t *logical_size = g_hash_table_lookup(p_ctx->index->file_to_sizes, path);
+  uint64_t num_blocks = 0;
+  int has_blocks = 0;
   if (logical_size != NULL) {
-    // walk through every block of the file and remove its reference
-    uint64_t num_blocks = (*logical_size + BLOCK_SIZE - 1) / BLOCK_SIZE;
-    for (uint64_t i = 0; i < num_blocks; i++) {
-      remove_block_dedup(p_ctx->index, path, i);
-    }
-    // remove the file size entry itself
-    g_hash_table_remove(p_ctx->index->file_to_sizes, path);
+    num_blocks = (*logical_size + BLOCK_SIZE - 1) / BLOCK_SIZE;
+    has_blocks = 1;
   }
-  pthread_mutex_unlock(&p_ctx->index->mutex);
+  pthread_rwlock_unlock(&p_ctx->index->metadata_rwlock);
+
+  if (has_blocks) {
+    // Liberta todas as referências em batch — 1 acquire de cada lock.
+    remove_blocks_dedup_batch(p_ctx->index, path, 0, num_blocks);
+
+    // Remove a entrada de file_to_sizes — write lock breve.
+    pthread_rwlock_wrlock(&p_ctx->index->metadata_rwlock);
+    g_hash_table_remove(p_ctx->index->file_to_sizes, path);
+    pthread_rwlock_unlock(&p_ctx->index->metadata_rwlock);
+  }
 
   // now actually delete the file
   int res = unlink(path);
@@ -352,23 +383,47 @@ static int xmp_chown(const char *path, uid_t uid, gid_t gid,
 
 // When a file is truncated, remove dedup references for the blocks
 // that are now beyond the new size, then shrink the actual file.
+//
+// A camada de dedup só opera com blocos alinhados a BLOCK_SIZE. Truncates
+// para size não-múltiplo de BLOCK_SIZE deixariam um bloco lógico parcial
+// onde o read_dedup leria 4 KiB inteiros, devolvendo bytes além do EOF
+// reportado por getattr. Para manter a invariante de alinhamento end-to-end
+// (consistente com o write_dedup), rejeitamos esses truncates.
 static int xmp_truncate(const char *path, off_t size,
                         struct fuse_file_info *fi) {
   struct fuse_context *f_ctx = fuse_get_context();
   Context *p_ctx = (Context *)f_ctx->private_data;
 
-  pthread_mutex_lock(&p_ctx->index->mutex);
+  // Rejeita size negativo (POSIX trata como erro) ou não-alinhado.
+  if (size < 0 || (size % BLOCK_SIZE) != 0)
+    return -EOPNOTSUPP;
+
+  // Read lock para descobrir o intervalo de blocos a libertar.
+  uint64_t new_block_count = 0;
+  uint64_t old_block_count = 0;
+  int needs_truncate_blocks = 0;
+  pthread_rwlock_rdlock(&p_ctx->index->metadata_rwlock);
   size_t *logical_size = g_hash_table_lookup(p_ctx->index->file_to_sizes, path);
   if (logical_size != NULL && (size_t)size < *logical_size) {
-    // only the blocks past the new size need to be removed
-    uint64_t new_block_count = (size + BLOCK_SIZE - 1) / BLOCK_SIZE;
-    uint64_t old_block_count = (*logical_size + BLOCK_SIZE - 1) / BLOCK_SIZE;
-    for (uint64_t i = new_block_count; i < old_block_count; i++) {
-      remove_block_dedup(p_ctx->index, path, i);
-    }
-    *logical_size = size;
+    new_block_count = (size + BLOCK_SIZE - 1) / BLOCK_SIZE;
+    old_block_count = (*logical_size + BLOCK_SIZE - 1) / BLOCK_SIZE;
+    needs_truncate_blocks = 1;
   }
-  pthread_mutex_unlock(&p_ctx->index->mutex);
+  pthread_rwlock_unlock(&p_ctx->index->metadata_rwlock);
+
+  if (needs_truncate_blocks) {
+    // Liberta as referências em batch.
+    remove_blocks_dedup_batch(p_ctx->index, path, new_block_count,
+                               old_block_count);
+
+    // Actualiza o tamanho lógico — write lock breve.
+    pthread_rwlock_wrlock(&p_ctx->index->metadata_rwlock);
+    size_t *ls = g_hash_table_lookup(p_ctx->index->file_to_sizes, path);
+    if (ls != NULL && (size_t)size < *ls) {
+      *ls = size;
+    }
+    pthread_rwlock_unlock(&p_ctx->index->metadata_rwlock);
+  }
 
   int res;
   if (fi != NULL)
@@ -472,11 +527,11 @@ static int xmp_read(const char *path, char *buf, size_t size, off_t offset,
   if (fd == -1)
     return -errno;
 
-  // read from the master file through the dedup layer
-  pthread_mutex_lock(&p_ctx->index->mutex);
+  // read_dedup faz locking interno: read lock só durante a fase de
+  // lookups; o pread propriamente dito corre sem qualquer lock,
+  // permitindo múltiplos preads em paralelo a offsets disjuntos.
   int total_read =
       read_dedup(p_ctx->index, path, buf, size, offset, p_ctx->masterFd);
-  pthread_mutex_unlock(&p_ctx->index->mutex);
 
   if (fi == NULL)
     close(fd);
@@ -515,11 +570,12 @@ static int xmp_write(const char *path, const char *buf, size_t size,
   if (fd == -1)
     return -errno;
 
-  // write through the dedup layer (handles dedup + overwrite)
-  pthread_mutex_lock(&p_ctx->index->mutex);
+  // write_dedup faz locking interno: read lock no Passe 1 (hash +
+  // lookup), nada no Passe 2 (pwrite), write lock no Passe 3
+  // (consolidação com double-check insert). Múltiplos pwrites correm
+  // em paralelo a offsets disjuntos.
   res = write_dedup(p_ctx->index, path, buf, size, offset, p_ctx->masterFd,
                     &p_ctx->nextBlockIndex);
-  pthread_mutex_unlock(&p_ctx->index->mutex);
 
   if (fi == NULL)
     close(fd);

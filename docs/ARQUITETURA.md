@@ -38,6 +38,15 @@ Componentes principais:
 
 Bloco físico: **4 KiB**. Hash: **SHA-512** (64 B).
 
+### Constraint do enunciado
+
+O trabalho prático garante que **todas as operações de leitura e escrita
+são alinhadas a `BLOCK_SIZE`** (offset e size múltiplos de 4 KiB). A
+biblioteca opera com base nesta assunção: writes não-alinhados são
+rejeitados com `-EOPNOTSUPP` (em vez de provocarem livelock no kernel,
+que era o comportamento pré-existente quando `write_dedup` retornava 0
+sem ter feito nada).
+
 ---
 
 ## 2. Estado Actual (pré-refactor)
@@ -253,13 +262,98 @@ divergência mensurável.
 - O ganho real de `io_uring` vem de **paralelismo** (write-back assíncrono,
   pipelining hash/I/O, múltiplos writers concorrentes).
 - O nosso modelo é **estritamente síncrono**: `xmp_write` regressa só com
-  os dados em disco; o `index->mutex` serializa todos os writes; não há
-  pipeline entre hashing e I/O.
+  os dados em disco; não há pipeline entre hashing e I/O.
 - Nestes cenários, `io_uring_submit_and_wait` ≈ `pwritev` em performance,
   com complexidade muito superior (dependência `liburing`, gestão de SQEs/CQEs,
   rollback per-CQE).
 - Para extrair valor real seria preciso adoptar **write-back assíncrono**,
   o que abdica de durabilidade síncrona — redesign maior, fora do âmbito.
+
+---
+
+## 5.4 Modelo de concorrência
+
+O FUSE corre multi-threaded por defeito (sem `-s`). Múltiplas threads do
+kernel podem chamar `xmp_read`/`xmp_write`/`xmp_unlink`/`xmp_truncate`/
+`xmp_getattr` em paralelo. A versão original serializava tudo num único
+mutex global; este refactor introduz paralelismo real.
+
+### Locks e atomics
+
+| Estrutura | Sincronização |
+|---|---|
+| `hash_to_master`, `file_to_master`, `file_to_sizes` | `pthread_rwlock_t metadata_rwlock` (rwlock — reads concorrentes) |
+| `MasterInfo` (incl. cleanup) | `metadata_rwlock` em modo write |
+| `MasterInfo.refcount` | `_Atomic uint32_t` (increment RELAXED, decrement+test ACQ_REL) |
+| `free_block_list` | `pthread_mutex_t freelist_mutex` |
+| `Context.nextBlockIndex` | `_Atomic uint64_t` (`__atomic_fetch_add` RELAXED) |
+
+### Hierarquia de locks (para evitar deadlocks)
+
+> Se for preciso pegar os dois, **`metadata_rwlock` ANTES de `freelist_mutex`**.
+> Nunca o inverso.
+
+### `write_dedup` por fases
+
+```
+Passe 1 (hash + lookup) ────► rdlock(metadata_rwlock)
+                              hash, lookup_by_hash, refcount++ atómico em HITs
+                              unlock
+
+Passe 1.5 (alocação)    ────► dentro de allocate_batch_storage_first:
+                              lock(freelist_mutex); drena GSList; unlock
+                              __atomic_fetch_add(nextBlockIndex, K, RELAXED)
+
+Passe 2 (flush)         ────► SEM LOCK
+                              pwrite por run contíguo (offsets disjuntos
+                              por construção; pwrite é thread-safe a nível
+                              de fd)
+
+Passe 3 (consolidar)    ────► wrlock(metadata_rwlock)
+                              double-check: relookup antes de inserir,
+                              para fechar race de cross-thread dedup
+                              insert_hash, insert_file_block, update sizes
+                              unlock
+
+                              se houve slots descartados pelo double-check:
+                              lock(freelist_mutex); concat; unlock
+```
+
+**Múltiplos `write_dedup` correm os Passes 1 e 2 em paralelo entre si**.
+Apenas o Passe 3 é serializado pelo wrlock.
+
+### `read_dedup` por fases
+
+```
+Phase 1 (lookups)       ────► rdlock(metadata_rwlock)
+                              copia masterBlockIndex para pairs[] local
+                              (NÃO guarda MasterInfo*)
+                              unlock
+
+Phases 2-5 (sort+pread) ────► SEM LOCK
+                              pread por run físico contíguo
+```
+
+Múltiplos `read_dedup` em paralelo, e em paralelo com Passe 1 do
+`write_dedup`.
+
+### Double-check insert (cross-thread dedup)
+
+No Passe 3 do `write_dedup`, antes de inserir um MasterInfo pendente em
+`hash_to_master`, fazemos um segundo lookup. Se outro thread já inseriu
+o mesmo conteúdo entretanto, descartamos o nosso pendente, devolvemos
+o slot à free list e usamos o existente (incrementando refcount).
+
+Custo: 1 pwrite ocasional desperdiçado (slot recicla-se imediatamente
+via free list). Garantia: **zero duplicados em hash_to_master**.
+
+### Trade-offs aceites
+
+- **Read concorrente com overwrite no mesmo `(file, offset)`** pode
+  retornar torn data se o slot antigo for reciclado durante o pread.
+  Workload FUSE realista raramente exibe este pattern.
+- **Pwrite ocasional desperdiçado** sob colisão cross-thread (resolvido
+  pelo double-check, sem corrupção).
 
 ---
 
@@ -309,13 +403,39 @@ sudo ./fuse.sh                    # terminal A
 sudo umount /mnt/fs
 ```
 
-### Teste de correctude (round-trip)
+### Teste de correctude single-thread (round-trip)
 
 ```bash
 sudo ./fuse.sh &                   # background
 sleep 1
 ./tests/roundtrip.sh 8             # 8 MiB
 ./tests/roundtrip.sh 64            # 64 MiB
+sudo umount /mnt/fs
+```
+
+### Teste de correctude concorrente
+
+Lança N cópias paralelas, cada uma a copiar conteúdo aleatório próprio
+para um ficheiro distinto, e valida md5 round-trip. Se os locks/atomics
+estiverem mal, as md5 vão divergir e o teste falha.
+
+```bash
+sudo ./fuse.sh &
+sleep 1
+./tests/concurrent_roundtrip.sh 8 4    # 8 threads × 4 MiB cada
+./tests/concurrent_roundtrip.sh 16 8   # 16 threads × 8 MiB cada
+sudo umount /mnt/fs
+```
+
+### Detectar races com ThreadSanitizer (recomendado)
+
+Build de debug com TSan apanha races que escapam ao raciocínio:
+
+```bash
+make clean
+CFLAGS="-fsanitize=thread -g" make
+sudo ./fuse.sh &     # com TSan activo, output extra em stderr se houver race
+./tests/concurrent_roundtrip.sh 16 8
 sudo umount /mnt/fs
 ```
 
@@ -326,6 +446,7 @@ sudo umount /mnt/fs
 | Tamanho `/masterFILE` | `stat -c %s /masterFILE` |
 | Syscalls `pwrite` | `bpf_programs/syscounter` durante benchmark |
 | Tamanho da freelist | inspecção de `/table_path_free_block_list` |
+| Wall-clock concorrente | `time ./tests/concurrent_roundtrip.sh 16 8` |
 
 ---
 
