@@ -78,9 +78,8 @@ int read_dedup(Index *index, const char *path, char *buf, size_t size,
                off_t offset, int masterFd) {
   size_t num_blocks = size / BLOCK_SIZE;
   uint64_t start_block = offset / BLOCK_SIZE;
-
-  if (num_blocks == 0)
-    return 0;
+  if (num_blocks == 0 || size % BLOCK_SIZE != 0)
+    return -EOPNOTSUPP;
 
   // Phase 1: Lookup all blocks and create pairs.
   // Read lock no metadata_rwlock — múltiplos read_dedup correm em
@@ -107,7 +106,7 @@ int read_dedup(Index *index, const char *path, char *buf, size_t size,
   pthread_rwlock_unlock(&index->metadata_rwlock);
 
   if (valid_blocks == 0)
-    return 0;  // EOF imediato.
+    return 0; // EOF imediato.
 
   // Phases 2-5 correm SEM LOCK. Os pairs[] são locais, e os preads
   // a offsets disjuntos no master file são thread-safe por POSIX.
@@ -220,7 +219,7 @@ void remove_block_dedup(Index *index, const char *path, uint64_t blockIndex) {
 // (1 acquire de metadata_rwlock + 1 acquire de freelist_mutex por
 // bloco). Mais eficiente para ficheiros grandes.
 void remove_blocks_dedup_batch(Index *index, const char *path,
-                                uint64_t start_block, uint64_t end_block) {
+                               uint64_t start_block, uint64_t end_block) {
   if (start_block >= end_block)
     return;
 
@@ -267,11 +266,11 @@ typedef enum { PLAN_HIT, PLAN_MISS } PlanKind;
 
 typedef struct {
   PlanKind kind;
-  uint64_t logical_blk;            // bloco lógico no ficheiro
-  uint64_t master_blk;              // só MISS: slot atribuído no master
-  const char *payload;              // só MISS: ptr para dentro de buf (BLOCK_SIZE bytes)
-  unsigned char hash[HASH_SIZE];   // hash do conteúdo deste bloco
-  MasterInfo *info;                 // partilhado: HIT → existente; MISS → pendente
+  uint64_t logical_blk; // bloco lógico no ficheiro
+  uint64_t master_blk;  // só MISS: slot atribuído no master
+  const char *payload;  // só MISS: ptr para dentro de buf (BLOCK_SIZE bytes)
+  unsigned char hash[HASH_SIZE]; // hash do conteúdo deste bloco
+  MasterInfo *info;              // partilhado: HIT → existente; MISS → pendente
 } PlanEntry;
 
 // -----------------------------------------------------------------------------
@@ -291,8 +290,8 @@ typedef struct {
 // append puro (free list vazia), e os reusos individuais não beneficiariam
 // de batching porque master_blk dispersos não cabem num único pwrite.
 static void allocate_batch_storage_first(Index *idx, uint64_t miss_count,
-                                          _Atomic uint64_t *next_block_index,
-                                          uint64_t *out) {
+                                         _Atomic uint64_t *next_block_index,
+                                         uint64_t *out) {
   uint64_t taken = 0;
 
   // Drena a free list pela head (LIFO). Lock isolado à parte que toca
@@ -314,8 +313,8 @@ static void allocate_batch_storage_first(Index *idx, uint64_t miss_count,
   // por syscall do kernel, com as suas próprias barreiras.
   uint64_t remaining = miss_count - taken;
   if (remaining > 0) {
-    uint64_t base = __atomic_fetch_add(next_block_index, remaining,
-                                        __ATOMIC_RELAXED);
+    uint64_t base =
+        __atomic_fetch_add(next_block_index, remaining, __ATOMIC_RELAXED);
     for (uint64_t i = 0; i < remaining; i++) {
       out[taken + i] = base + i;
     }
@@ -353,7 +352,8 @@ static int flush_plan(int masterFd, PlanEntry *plan, size_t n) {
     while (i < n && plan[i].kind == PLAN_HIT) {
       i++;
     }
-    if (i == n) break;
+    if (i == n)
+      break;
 
     // Construir um run a partir do MISS actual, juntando MISSes seguintes
     // cujo master_blk seja exactamente o anterior + 1. Como o plan é
@@ -459,8 +459,7 @@ static void rollback_allocations(Index *idx, PlanEntry *plan, size_t n) {
 // -----------------------------------------------------------------------------
 
 int write_dedup(Index *index, const char *path, const char *buf, size_t size,
-                off_t offset, int masterFd,
-                _Atomic uint64_t *nextBlockIndex) {
+                off_t offset, int masterFd, _Atomic uint64_t *nextBlockIndex) {
   // Caso degenerado: write de 0 bytes não faz nada.
   if (size == 0)
     return 0;
@@ -494,8 +493,7 @@ int write_dedup(Index *index, const char *path, const char *buf, size_t size,
   // não foram inseridos no hash_to_master oficial. Necessária para tratar
   // intra-batch dedup: se dois blocos do request têm o mesmo conteúdo, o
   // primeiro vira MISS e o segundo deve ser HIT, mesmo antes do flush.
-  GHashTable *pending_hashes =
-      g_hash_table_new(hash512_hash, hash512_equal);
+  GHashTable *pending_hashes = g_hash_table_new(hash512_hash, hash512_equal);
 
   // ---------------------------------------------------------------------------
   // PASSE 1 — Decisão. Hash + lookup. Read lock no metadata_rwlock
@@ -552,7 +550,7 @@ int write_dedup(Index *index, const char *path, const char *buf, size_t size,
     // freelist_mutex breve durante a drenagem, depois usa
     // __atomic_fetch_add no nextBlockIndex sem qualquer lock.
     allocate_batch_storage_first(index, miss_count, nextBlockIndex,
-                                  master_blks);
+                                 master_blks);
 
     // Preenche master_blk em cada PlanEntry MISS.
     size_t m = 0;
@@ -639,8 +637,7 @@ int write_dedup(Index *index, const char *path, const char *buf, size_t size,
   // remove_block_dedup faz um lookup duplo desnecessário. Esta versão
   // faz lookup uma vez e decrementa inline.)
   for (size_t i = 0; i < num_blocks; i++) {
-    MasterInfo *old =
-        lookup_by_file_block(index, path, plan[i].logical_blk);
+    MasterInfo *old = lookup_by_file_block(index, path, plan[i].logical_blk);
     if (old != NULL) {
       // Decrement atómico do antigo. ACQ_REL: vê estado consistente do
       // MasterInfo se ganharmos a corrida ao 0.
